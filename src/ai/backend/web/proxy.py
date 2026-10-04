@@ -265,7 +265,12 @@ async def _run_proxy_request(
                     backend_rqst.headers["Content-Type"] = frontend_rqst.headers[
                         "Content-Type"
                     ]  # preserve raw value
-                if "Content-Length" in frontend_rqst.headers and not secure_context:
+                # A decoded body doesn't match the client's Content-Length; let aiohttp frame it.
+                if (
+                    "Content-Length" in frontend_rqst.headers
+                    and "Content-Encoding" not in frontend_rqst.headers
+                    and not secure_context
+                ):
                     backend_rqst.headers["Content-Length"] = frontend_rqst.headers["Content-Length"]
                 if "Content-Length" in frontend_rqst.headers and secure_context:
                     backend_rqst.headers["Content-Length"] = str(decrypted_payload_length)
@@ -473,7 +478,12 @@ async def web_handler_with_jwt(
                     backend_rqst.headers["Content-Type"] = frontend_rqst.headers[
                         "Content-Type"
                     ]  # preserve raw value
-                if "Content-Length" in frontend_rqst.headers and not secure_context:
+                # A decoded body doesn't match the client's Content-Length; let aiohttp frame it.
+                if (
+                    "Content-Length" in frontend_rqst.headers
+                    and "Content-Encoding" not in frontend_rqst.headers
+                    and not secure_context
+                ):
                     backend_rqst.headers["Content-Length"] = frontend_rqst.headers["Content-Length"]
                 if "Content-Length" in frontend_rqst.headers and secure_context:
                     backend_rqst.headers["Content-Length"] = str(decrypted_payload_length)
