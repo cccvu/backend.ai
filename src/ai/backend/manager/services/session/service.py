@@ -1379,7 +1379,12 @@ class SessionService:
         )
         if not wsproxy_addr:
             raise ServiceUnavailable("No coordinator configured for this resource group")
-        client = self._appproxy_client_pool.load_client(wsproxy_addr, "")
+        wsproxy_api_token = await self._session_repository.get_scaling_group_wsproxy_api_token(
+            session_data.scaling_group_name
+        )
+        if not wsproxy_api_token:
+            raise ServiceUnavailable("No coordinator API token configured for this resource group")
+        client = self._appproxy_client_pool.load_client(wsproxy_addr, wsproxy_api_token)
         wsproxy_status = await client.fetch_status()
         if wsproxy_status.advertise_address:
             wsproxy_advertise_addr = wsproxy_status.advertise_address
@@ -1457,8 +1462,10 @@ class SessionService:
             req.post(
                 f"{wsproxy_addr}/v2/conf",
                 json=body,
+                headers={"X-BackendAI-Token": wsproxy_api_token},
             ) as resp,
         ):
+            resp.raise_for_status()
             token_json = await resp.json()
 
             return StartServiceActionResult(

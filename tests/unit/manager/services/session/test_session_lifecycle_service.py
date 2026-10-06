@@ -13,6 +13,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import UUID, uuid4
 
+import aiohttp
 import pytest
 from dateutil.tz import tzutc
 
@@ -1970,6 +1971,9 @@ class TestStartService:
         mock_session_repository.get_scaling_group_wsproxy_addr = AsyncMock(
             return_value="http://wsproxy:10200"
         )
+        mock_session_repository.get_scaling_group_wsproxy_api_token = AsyncMock(
+            return_value="coordinator-api-token"
+        )
 
         mock_client = MagicMock()
         mock_status = MagicMock()
@@ -2004,6 +2008,144 @@ class TestStartService:
 
         assert result.token == "test-token-xyz"
         assert result.wsproxy_addr == "ws://wsproxy-public:10200"
+        mock_ctx.post.assert_called_once()
+        conf_args = mock_ctx.post.call_args
+        assert conf_args.args[0] == "http://wsproxy:10200/v2/conf"
+        assert conf_args.kwargs["headers"] == {"X-BackendAI-Token": "coordinator-api-token"}
+        mock_resp.raise_for_status.assert_called_once()
+        mock_appproxy_client_pool.load_client.assert_called_once_with(
+            "http://wsproxy:10200", "coordinator-api-token"
+        )
+
+    @pytest.mark.parametrize("api_token", [None, ""])
+    async def test_missing_api_token_raises_before_any_request(
+        self,
+        api_token: str | None,
+        session_service: SessionService,
+        mock_session_repository: MagicMock,
+        mock_agent_registry: MagicMock,
+        mock_appproxy_client_pool: MagicMock,
+        sample_session_id: SessionId,
+        sample_access_key: AccessKey,
+        sample_user_id: UUID,
+        sample_group_id: UUID,
+        sample_kernel_id: KernelId,
+    ) -> None:
+        mock_session = _make_mock_session(
+            sample_session_id, sample_access_key, sample_user_id, sample_group_id, sample_kernel_id
+        )
+        info = _make_routing_info(
+            mock_session,
+            sample_kernel_id,
+            [
+                {
+                    "name": "jupyter",
+                    "host_ports": [8888],
+                    "container_ports": [8888],
+                    "is_inference": False,
+                },
+            ],
+        )
+        mock_session_repository.get_session_with_routing_minimal = AsyncMock(return_value=info)
+        mock_session_repository.get_scaling_group_wsproxy_addr = AsyncMock(
+            return_value="http://wsproxy:10200"
+        )
+        mock_session_repository.get_scaling_group_wsproxy_api_token = AsyncMock(
+            return_value=api_token
+        )
+        mock_agent_registry.start_service = AsyncMock(return_value={"status": "started"})
+
+        action = StartServiceAction(
+            session_id=SessionID(sample_session_id),
+            service="jupyter",
+            login_session_token="login-token",
+            port=None,
+            arguments=None,
+            envs=None,
+        )
+
+        with patch("aiohttp.ClientSession") as mock_aiohttp:
+            with pytest.raises(ServiceUnavailable):
+                await session_service.start_service(action)
+
+        mock_appproxy_client_pool.load_client.assert_not_called()
+        mock_agent_registry.start_service.assert_not_called()
+        mock_aiohttp.assert_not_called()
+
+    async def test_rejected_conf_request_raises(
+        self,
+        session_service: SessionService,
+        mock_session_repository: MagicMock,
+        mock_agent_registry: MagicMock,
+        mock_appproxy_client_pool: MagicMock,
+        sample_session_id: SessionId,
+        sample_access_key: AccessKey,
+        sample_user_id: UUID,
+        sample_group_id: UUID,
+        sample_kernel_id: KernelId,
+    ) -> None:
+        mock_session = _make_mock_session(
+            sample_session_id, sample_access_key, sample_user_id, sample_group_id, sample_kernel_id
+        )
+        info = _make_routing_info(
+            mock_session,
+            sample_kernel_id,
+            [
+                {
+                    "name": "jupyter",
+                    "host_ports": [8888],
+                    "container_ports": [8888],
+                    "is_inference": False,
+                },
+            ],
+        )
+        mock_session_repository.get_session_with_routing_minimal = AsyncMock(return_value=info)
+        mock_session_repository.get_scaling_group_wsproxy_addr = AsyncMock(
+            return_value="http://wsproxy:10200"
+        )
+        mock_session_repository.get_scaling_group_wsproxy_api_token = AsyncMock(
+            return_value="stale-api-token"
+        )
+
+        mock_client = MagicMock()
+        mock_status = MagicMock()
+        mock_status.advertise_address = None
+        mock_client.fetch_status = AsyncMock(return_value=mock_status)
+        mock_appproxy_client_pool.load_client.return_value = mock_client
+
+        mock_agent_registry.start_service = AsyncMock(return_value={"status": "started"})
+
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock(
+            side_effect=aiohttp.ClientResponseError(
+                MagicMock(), (), status=401, message="Unauthorized"
+            )
+        )
+        mock_resp.json = AsyncMock(return_value={"error": "Unauthorized access"})
+
+        action = StartServiceAction(
+            session_id=SessionID(sample_session_id),
+            service="jupyter",
+            login_session_token="login-token",
+            port=None,
+            arguments=None,
+            envs=None,
+        )
+
+        with patch("aiohttp.ClientSession") as mock_aiohttp:
+            mock_ctx = MagicMock()
+            mock_ctx.__aenter__ = AsyncMock(return_value=mock_ctx)
+            mock_ctx.__aexit__ = AsyncMock(return_value=False)
+            mock_ctx.post.return_value = MagicMock()
+            mock_ctx.post.return_value.__aenter__ = AsyncMock(return_value=mock_resp)
+            mock_ctx.post.return_value.__aexit__ = AsyncMock(return_value=False)
+            mock_aiohttp.return_value = mock_ctx
+
+            with pytest.raises(aiohttp.ClientResponseError) as exc_info:
+                await session_service.start_service(action)
+
+        assert exc_info.value.status == 401
+        mock_resp.json.assert_not_called()
 
     async def test_invalid_service_name_raises_app_not_found(
         self,
@@ -2034,6 +2176,9 @@ class TestStartService:
         mock_session_repository.get_session_with_routing_minimal = AsyncMock(return_value=info)
         mock_session_repository.get_scaling_group_wsproxy_addr = AsyncMock(
             return_value="http://wsproxy:10200"
+        )
+        mock_session_repository.get_scaling_group_wsproxy_api_token = AsyncMock(
+            return_value="coordinator-api-token"
         )
 
         mock_client = MagicMock()
@@ -2112,6 +2257,9 @@ class TestStartService:
         mock_session_repository.get_session_with_routing_minimal = AsyncMock(return_value=info)
         mock_session_repository.get_scaling_group_wsproxy_addr = AsyncMock(
             return_value="http://wsproxy:10200"
+        )
+        mock_session_repository.get_scaling_group_wsproxy_api_token = AsyncMock(
+            return_value="coordinator-api-token"
         )
 
         mock_client = MagicMock()

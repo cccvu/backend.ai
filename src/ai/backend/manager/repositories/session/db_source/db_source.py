@@ -358,6 +358,20 @@ class SessionDBSource:
             sgroup = result.first()
             return sgroup.wsproxy_addr if sgroup else None
 
+    async def get_scaling_group_wsproxy_api_token(
+        self,
+        scaling_group_name: str,
+    ) -> str | None:
+        async with self._db.begin_readonly() as conn:
+            query = (
+                sa.select(scaling_groups.c.wsproxy_api_token)
+                .select_from(scaling_groups)
+                .where(scaling_groups.c.name == scaling_group_name)
+            )
+            result = await conn.execute(query)
+            sgroup = result.first()
+            return sgroup.wsproxy_api_token if sgroup else None
+
     async def get_session_by_id(
         self,
         session_id: str | SessionId,
