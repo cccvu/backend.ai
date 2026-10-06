@@ -5,6 +5,7 @@ from collections.abc import AsyncIterator, Iterable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Final, Self, override
 
 from aiotools import cancel_and_wait
@@ -23,6 +24,7 @@ from redis.asyncio.sentinel import Sentinel
 
 from ai.backend.common.exception import (
     ClientNotConnectedError,
+    InvalidConfigError,
     ValkeyRoleMismatchError,
     ValkeySentinelMasterNotFound,
 )
@@ -108,6 +110,35 @@ SSL_CERT_NONE = "none"
 SSL_CERT_REQUIRED = "required"
 
 
+def build_tls_config(
+    *,
+    use_tls: bool,
+    tls_skip_verify: bool,
+    tls_ca_file: str | None,
+) -> TlsAdvancedConfiguration:
+    """
+    Build the glide TLS configuration for a Valkey target.
+
+    The CA file is read only when TLS is enabled, since it has no meaning on a
+    plaintext connection.
+
+    Raises:
+        InvalidConfigError: If the CA file cannot be read or is empty.
+    """
+    root_pem_cacerts: bytes | None = None
+    if use_tls and tls_ca_file:
+        try:
+            root_pem_cacerts = Path(tls_ca_file).read_bytes()
+        except OSError as e:
+            raise InvalidConfigError(f"Cannot read the TLS CA file {tls_ca_file!r}: {e}") from e
+        if not root_pem_cacerts:
+            raise InvalidConfigError(f"The TLS CA file {tls_ca_file!r} is empty")
+    return TlsAdvancedConfiguration(
+        use_insecure_tls=tls_skip_verify,
+        root_pem_cacerts=root_pem_cacerts,
+    )
+
+
 @dataclass
 class ValkeyStandaloneTarget:
     address: str
@@ -115,6 +146,7 @@ class ValkeyStandaloneTarget:
     request_timeout: int | None = None
     use_tls: bool = False
     tls_skip_verify: bool = False
+    tls_ca_file: str | None = None
 
     @classmethod
     def from_valkey_target(cls, valkey_target: ValkeyTarget) -> Self:
@@ -129,6 +161,7 @@ class ValkeyStandaloneTarget:
             request_timeout=valkey_target.request_timeout,
             use_tls=valkey_target.use_tls,
             tls_skip_verify=valkey_target.tls_skip_verify,
+            tls_ca_file=valkey_target.tls_ca_file,
         )
 
 
@@ -141,6 +174,7 @@ class ValkeySentinelTarget:
     request_timeout: int | None = None
     use_tls: bool = False
     tls_skip_verify: bool = False
+    tls_ca_file: str | None = None
 
     @classmethod
     def from_valkey_target(cls, valkey_target: ValkeyTarget) -> Self:
@@ -161,6 +195,7 @@ class ValkeySentinelTarget:
             request_timeout=valkey_target.request_timeout,
             use_tls=valkey_target.use_tls,
             tls_skip_verify=valkey_target.tls_skip_verify,
+            tls_ca_file=valkey_target.tls_ca_file,
         )
 
 
@@ -280,8 +315,10 @@ class ValkeyStandaloneClient(AbstractValkeyClient):
             else None,
             use_tls=self._target.use_tls,
             advanced_config=AdvancedGlideClientConfiguration(
-                tls_config=TlsAdvancedConfiguration(
-                    use_insecure_tls=self._target.tls_skip_verify,
+                tls_config=build_tls_config(
+                    use_tls=self._target.use_tls,
+                    tls_skip_verify=self._target.tls_skip_verify,
+                    tls_ca_file=self._target.tls_ca_file,
                 ),
             ),
         )
@@ -364,6 +401,7 @@ class ValkeySentinelClient(AbstractValkeyClient):
             "password": sentinel_auth,
             "ssl": target.use_tls,
             "ssl_cert_reqs": SSL_CERT_NONE if target.tls_skip_verify else SSL_CERT_REQUIRED,
+            "ssl_ca_certs": target.tls_ca_file,
         }
         self._sentinel = Sentinel(
             sentinel_addrs,
@@ -420,8 +458,10 @@ class ValkeySentinelClient(AbstractValkeyClient):
             else None,
             use_tls=self._target.use_tls,
             advanced_config=AdvancedGlideClientConfiguration(
-                tls_config=TlsAdvancedConfiguration(
-                    use_insecure_tls=self._target.tls_skip_verify,
+                tls_config=build_tls_config(
+                    use_tls=self._target.use_tls,
+                    tls_skip_verify=self._target.tls_skip_verify,
+                    tls_ca_file=self._target.tls_ca_file,
                 ),
             ),
         )
@@ -551,6 +591,7 @@ def create_valkey_client(
         request_timeout=_MONITOR_REQUEST_TIMEOUT,
         use_tls=valkey_target.use_tls,
         tls_skip_verify=valkey_target.tls_skip_verify,
+        tls_ca_file=valkey_target.tls_ca_file,
     )
     monitor_client = _create_valkey_client_internal(
         monitor_target, db_id, f"{human_readable_name}-monitor", None

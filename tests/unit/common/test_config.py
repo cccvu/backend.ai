@@ -22,6 +22,7 @@ from ai.backend.common.config import (
     _merge_service_config,
     merge,
     override_key,
+    redis_config_iv,
 )
 
 
@@ -749,3 +750,29 @@ class TestModelDefinitionWithArgsAppended:
         assert first is not None and second is not None
         assert first.start_command == "a --shared true"
         assert second.start_command == "b --shared true"
+
+
+class TestRedisConfigIv:
+    """Values read from etcd are strings, so the TLS flags must accept them."""
+
+    def test_accepts_string_tls_flags(self) -> None:
+        config = redis_config_iv.check({
+            "addr": "127.0.0.1:6379",
+            "use_tls": "true",
+            "tls_skip_verify": "false",
+            "tls_ca_file": "/etc/redis/ca.pem",
+            "override_configs": {
+                "stream": {"addr": "127.0.0.1:6380", "use_tls": "true"},
+            },
+        })
+        assert config["use_tls"] is True
+        assert config["tls_skip_verify"] is False
+        assert config["tls_ca_file"] == "/etc/redis/ca.pem"
+        assert config["override_configs"]["stream"]["use_tls"] is True
+        assert config["override_configs"]["stream"]["tls_ca_file"] is None
+
+    def test_tls_disabled_by_default(self) -> None:
+        config = redis_config_iv.check({"addr": "127.0.0.1:6379"})
+        assert config["use_tls"] is False
+        assert config["tls_skip_verify"] is False
+        assert config["tls_ca_file"] is None

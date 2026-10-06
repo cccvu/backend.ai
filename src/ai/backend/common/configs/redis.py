@@ -240,6 +240,22 @@ class SingleRedisConfig(BackendAISchema):
             example=ConfigExample(local="true", prod="false"),
         ),
     ]
+    tls_ca_file: Annotated[
+        str | None,
+        Field(
+            default=None,
+            validation_alias=AliasChoices("tls_ca_file", "tls-ca-file"),
+        ),
+        BackendAIConfigMeta(
+            description=(
+                "Path to a PEM file of CA certificates used to verify the Redis server "
+                "certificate when use_tls is enabled. "
+                "If None, the system's default trust store is used."
+            ),
+            added_version="26.8.4",
+            example=ConfigExample(local="", prod="/etc/backend.ai/redis/ca.pem"),
+        ),
+    ]
 
     @field_validator("sentinel", mode="before")
     @classmethod
@@ -285,6 +301,9 @@ class SingleRedisConfig(BackendAISchema):
             password=self.password,
             sentinel_password=self.sentinel_password,
             redis_helper_config=self.redis_helper_config.to_dict(),
+            use_tls=self.use_tls,
+            tls_skip_verify=self.tls_skip_verify,
+            tls_ca_file=self.tls_ca_file,
         )
 
     def to_valkey_target(self) -> ValkeyTarget:
@@ -304,6 +323,9 @@ class SingleRedisConfig(BackendAISchema):
             password=self.password,
             sentinel_password=self.sentinel_password,
             request_timeout=self.request_timeout,
+            use_tls=self.use_tls,
+            tls_skip_verify=self.tls_skip_verify,
+            tls_ca_file=self.tls_ca_file,
         )
 
 
@@ -348,6 +370,9 @@ class RedisConfig(SingleRedisConfig):
             sentinel_password=self.sentinel_password,
             redis_helper_config=self.redis_helper_config.to_dict(),
             override_targets=override_targets,
+            use_tls=self.use_tls,
+            tls_skip_verify=self.tls_skip_verify,
+            tls_ca_file=self.tls_ca_file,
         )
 
     def to_valkey_profile_target(self) -> ValkeyProfileTarget:
@@ -371,4 +396,7 @@ class RedisConfig(SingleRedisConfig):
             sentinel_password=self.sentinel_password,
             override_targets=override_targets,
             request_timeout=self.request_timeout,
+            use_tls=self.use_tls,
+            tls_skip_verify=self.tls_skip_verify,
+            tls_ca_file=self.tls_ca_file,
         )

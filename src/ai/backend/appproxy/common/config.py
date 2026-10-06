@@ -184,6 +184,40 @@ class RedisConfig(BaseSchema):
             composite=CompositeType.FIELD,
         ),
     ]
+    use_tls: Annotated[
+        bool,
+        Field(default=False),
+        BackendAIConfigMeta(
+            description="Whether to use TLS for Redis connections.",
+            added_version="26.8.4",
+            example=ConfigExample(local="false", prod="true"),
+        ),
+    ]
+    tls_skip_verify: Annotated[
+        bool,
+        Field(default=False),
+        BackendAIConfigMeta(
+            description=(
+                "Whether to skip TLS certificate verification. "
+                "Set to True for self-signed certificates or development environments."
+            ),
+            added_version="26.8.4",
+            example=ConfigExample(local="true", prod="false"),
+        ),
+    ]
+    tls_ca_file: Annotated[
+        str | None,
+        Field(default=None),
+        BackendAIConfigMeta(
+            description=(
+                "Path to a PEM file of CA certificates used to verify the Redis server "
+                "certificate when use_tls is enabled. "
+                "If None, the system's default trust store is used."
+            ),
+            added_version="26.8.4",
+            example=ConfigExample(local="", prod="/etc/backend.ai/redis/ca.pem"),
+        ),
+    ]
 
     def to_dict(self) -> dict[str, Any]:
         base = self.model_dump()

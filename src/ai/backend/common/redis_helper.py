@@ -21,7 +21,6 @@ from glide import (
     GlideClientConfiguration,
     NodeAddress,
     ServerCredentials,
-    TlsAdvancedConfiguration,
 )
 from redis.asyncio import BlockingConnectionPool, ConnectionPool, Redis
 from redis.asyncio.client import Pipeline
@@ -29,6 +28,7 @@ from redis.asyncio.sentinel import MasterNotFoundError, Sentinel, SlaveNotFoundE
 from redis.backoff import ExponentialBackoff
 from redis.retry import Retry
 
+from ai.backend.common.clients.valkey_client.client import build_tls_config
 from ai.backend.common.utils import addr_to_hostport_pair
 from ai.backend.logging import BraceStyleAdapter
 
@@ -192,6 +192,18 @@ def _get_redis_url_schema(redis_target: RedisTarget) -> str:
     return "redis"
 
 
+def _get_ssl_conn_opts(redis_target: RedisTarget) -> dict[str, Any]:
+    """
+    Returns the TLS options for a connection made from a ``rediss://`` URL.
+    """
+    if not redis_target.use_tls:
+        return {}
+    return {
+        "ssl_cert_reqs": SSL_CERT_NONE if redis_target.tls_skip_verify else SSL_CERT_REQUIRED,
+        "ssl_ca_certs": redis_target.tls_ca_file,
+    }
+
+
 def _parse_redis_url(redis_target: RedisTarget, db: int) -> yarl.URL:
     redis_url = redis_target.addr
     if redis_url is None:
@@ -252,6 +264,7 @@ def get_redis_object(
             "password": sentinel_auth,
             "ssl": redis_target.use_tls,
             "ssl_cert_reqs": SSL_CERT_NONE if redis_target.tls_skip_verify else SSL_CERT_REQUIRED,
+            "ssl_ca_certs": redis_target.tls_ca_file,
         }
         sentinel = Sentinel(
             [(str(host), port) for host, port in sentinel_addresses],
@@ -279,6 +292,7 @@ def get_redis_object(
         str(url),
         **conn_pool_opts,
         **conn_opts,
+        **_get_ssl_conn_opts(redis_target),
     )
     return RedisConnectionInfo(
         client=Redis.from_pool(connection_pool),  # type: ignore[attr-defined]
@@ -340,6 +354,7 @@ def get_redis_object_for_lock(
             "password": sentinel_auth,
             "ssl": redis_target.use_tls,
             "ssl_cert_reqs": SSL_CERT_NONE if redis_target.tls_skip_verify else SSL_CERT_REQUIRED,
+            "ssl_ca_certs": redis_target.tls_ca_file,
         }
         sentinel = Sentinel(
             [(str(host), port) for host, port in sentinel_addresses],
@@ -367,6 +382,7 @@ def get_redis_object_for_lock(
         str(url),
         **conn_pool_opts,
         **conn_opts,
+        **_get_ssl_conn_opts(redis_target),
     )
     return RedisConnectionInfo(
         client=Redis.from_pool(connection_pool),  # type: ignore[attr-defined]
@@ -414,8 +430,10 @@ async def create_valkey_client(
         addresses,
         use_tls=valkey_target.use_tls,
         advanced_config=AdvancedGlideClientConfiguration(
-            tls_config=TlsAdvancedConfiguration(
-                use_insecure_tls=valkey_target.tls_skip_verify,
+            tls_config=build_tls_config(
+                use_tls=valkey_target.use_tls,
+                tls_skip_verify=valkey_target.tls_skip_verify,
+                tls_ca_file=valkey_target.tls_ca_file,
             ),
         ),
         credentials=credentials,

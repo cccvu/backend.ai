@@ -2025,6 +2025,7 @@ class ValkeyTarget:
     request_timeout: int | None = None
     use_tls: bool = False
     tls_skip_verify: bool = False
+    tls_ca_file: str | None = None
 
     def __getitem__(self, key: str) -> Any:
         return getattr(self, key)
@@ -2049,6 +2050,7 @@ class RedisTarget:
     redis_helper_config: RedisHelperConfig | None = None
     use_tls: bool = False
     tls_skip_verify: bool = False
+    tls_ca_file: str | None = None
 
     def __getitem__(self, key: str) -> Any:
         return getattr(self, key)
@@ -2072,6 +2074,7 @@ class RedisTarget:
             redis_helper_config=self.redis_helper_config,
             use_tls=self.use_tls,
             tls_skip_verify=self.tls_skip_verify,
+            tls_ca_file=self.tls_ca_file,
         )
 
     def to_valkey_target(self) -> ValkeyTarget:
@@ -2096,6 +2099,7 @@ class RedisTarget:
             request_timeout=None,
             use_tls=self.use_tls,
             tls_skip_verify=self.tls_skip_verify,
+            tls_ca_file=self.tls_ca_file,
         )
 
 
@@ -2114,6 +2118,9 @@ class ValkeyProfileTarget:
         sentinel_password: str | None = None,
         request_timeout: int | None = None,
         override_targets: Mapping[str, ValkeyTarget] | None = None,
+        use_tls: bool = False,
+        tls_skip_verify: bool = False,
+        tls_ca_file: str | None = None,
     ) -> None:
         self._base_target = ValkeyTarget(
             addr=addr,
@@ -2122,6 +2129,9 @@ class ValkeyProfileTarget:
             password=password,
             sentinel_password=sentinel_password,
             request_timeout=request_timeout,
+            use_tls=use_tls,
+            tls_skip_verify=tls_skip_verify,
+            tls_ca_file=tls_ca_file,
         )
         self._override_targets = override_targets
 
@@ -2149,6 +2159,7 @@ class RedisProfileTarget:
         override_targets: Mapping[str, RedisTarget] | None = None,
         use_tls: bool = False,
         tls_skip_verify: bool = False,
+        tls_ca_file: str | None = None,
     ) -> None:
         self._base_target = RedisTarget(
             addr=addr,
@@ -2159,6 +2170,7 @@ class RedisProfileTarget:
             redis_helper_config=redis_helper_config,
             use_tls=use_tls,
             tls_skip_verify=tls_skip_verify,
+            tls_ca_file=tls_ca_file,
         )
         self._override_targets = override_targets
 
@@ -2209,6 +2221,9 @@ class RedisProfileTarget:
             sentinel_password=data.get("sentinel_password"),
             redis_helper_config=data.get("redis_helper_config"),
             override_targets=override_targets,
+            use_tls=data.get("use_tls", False),
+            tls_skip_verify=data.get("tls_skip_verify", False),
+            tls_ca_file=data.get("tls_ca_file"),
         )
 
 
