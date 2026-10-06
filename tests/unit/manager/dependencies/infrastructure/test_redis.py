@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from unittest.mock import AsyncMock, patch
+
 import pytest
 
+from ai.backend.common.clients.valkey_client.valkey_session.client import ValkeySessionClient
 from ai.backend.common.config import redis_config_iv
 from ai.backend.common.typed_validators import HostPortPair as HostPortPairModel
 from ai.backend.common.types import HostPortPair
@@ -34,6 +37,38 @@ class TestValkeyDependency:
 
         # Create minimal ManagerUnifiedConfig with just redis settings
         return ManagerUnifiedConfig(redis=redis_config)  # type: ignore[call-arg]
+
+    @pytest.fixture
+    def manager_config_with_session_override(
+        self,
+        redis_container: tuple[str, HostPortPairModel],
+    ) -> ManagerUnifiedConfig:
+        """Create a manager config whose session role has its own Redis target."""
+        _, redis_addr = redis_container
+        addr = HostPortPair(host=redis_addr.host, port=redis_addr.port)
+        redis_config = redis_config_iv.check({
+            "addr": addr,
+            "override_configs": {
+                "session": {"addr": addr, "password": "session-password"},
+            },
+        })
+        return ManagerUnifiedConfig.model_validate({"redis": redis_config})
+
+    async def test_session_client_uses_session_role(
+        self,
+        manager_config_with_session_override: ManagerUnifiedConfig,
+    ) -> None:
+        """The login-session client should honor the session role override."""
+        dependency = ValkeyDependency()
+
+        with patch.object(
+            ValkeySessionClient, "create", new_callable=AsyncMock
+        ) as mock_session_create:
+            async with dependency.provide(manager_config_with_session_override) as clients:
+                assert isinstance(clients, ValkeyClients)
+
+        session_target = mock_session_create.call_args.args[0]
+        assert session_target.password == "session-password"
 
     async def test_provide_valkey_clients(
         self,

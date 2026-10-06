@@ -145,7 +145,7 @@ class ValkeyDependency(InfrastructureDependency[ValkeyClients]):
                 human_readable_name="ratelimit",
             ),
             session=await ValkeySessionClient.create(
-                valkey_profile_target.profile_target(RedisRole.STATISTICS),
+                valkey_profile_target.profile_target(RedisRole.SESSION),
                 db_id=REDIS_STATISTICS_DB,
                 human_readable_name="session",
             ),

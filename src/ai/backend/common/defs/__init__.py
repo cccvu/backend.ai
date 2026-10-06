@@ -24,6 +24,7 @@ class RedisRole(StrEnum):
     CONTAINER_LOG = "container_log"
     BGTASK = "bgtask"
     TUS = "tus"
+    SESSION = "session"
 
 
 DEFAULT_FILE_IO_TIMEOUT: Final = 10
