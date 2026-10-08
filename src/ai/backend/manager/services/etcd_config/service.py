@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-import collections
-from collections.abc import Mapping
+import logging
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Final
 
-from ai.backend.common.json import load_json
+from pydantic import TypeAdapter
+
 from ai.backend.common.types import AcceleratorMetadata
+from ai.backend.logging.utils import BraceStyleAdapter
 from ai.backend.manager.errors.api import InvalidAPIParameters
 
 from .actions.delete_config import DeleteConfigAction, DeleteConfigActionResult
@@ -26,6 +28,12 @@ if TYPE_CHECKING:
     from ai.backend.manager.repositories.etcd_config import EtcdConfigRepository
 
 __all__ = ("EtcdConfigService",)
+
+log = BraceStyleAdapter(logging.getLogger(__spec__.name))
+
+_ACCELERATOR_METADATA_ADAPTER: Final[TypeAdapter[AcceleratorMetadata]] = TypeAdapter(
+    AcceleratorMetadata
+)
 
 KNOWN_SLOT_METADATA: dict[str, AcceleratorMetadata] = {
     "cpu": {
@@ -116,21 +124,17 @@ class EtcdConfigService:
         """Get resource metadata with optional scaling group filter."""
         known_slots = await self._config_provider.legacy_etcd_config_loader.get_resource_slots()
 
-        # Collect plugin-reported accelerator metadata
-        computer_metadata = await self._valkey_stat.get_computer_metadata()
-        reported_accelerator_metadata: dict[str, AcceleratorMetadata] = {
-            slot_name: cast(AcceleratorMetadata, load_json(metadata_json))
-            for slot_name, metadata_json in computer_metadata.items()
+        # Preconfigured metadata always wins; agents report metadata only for other slots.
+        accelerator_metadata: dict[str, AcceleratorMetadata] = {
+            slot_name: metadata
+            for slot_name, metadata in KNOWN_SLOT_METADATA.items()
+            if slot_name in known_slots
         }
-
-        # Merge reported metadata and preconfigured metadata (for legacy plugins)
-        accelerator_metadata: dict[str, AcceleratorMetadata] = {}
-        for slot_name, metadata in collections.ChainMap(
-            reported_accelerator_metadata,
-            KNOWN_SLOT_METADATA,
-        ).items():
-            if slot_name in known_slots:
-                accelerator_metadata[slot_name] = metadata
+        unknown_slots = [
+            str(slot_name) for slot_name in known_slots if slot_name not in KNOWN_SLOT_METADATA
+        ]
+        if unknown_slots:
+            accelerator_metadata.update(await self._get_reported_metadata(unknown_slots))
 
         # Optionally filter by the slots reported by the given resource group's agents
         if action.sgroup is not None:
@@ -142,6 +146,22 @@ class EtcdConfigService:
             }
 
         return GetResourceMetadataActionResult(metadata=accelerator_metadata)
+
+    async def _get_reported_metadata(
+        self, slot_names: Sequence[str]
+    ) -> dict[str, AcceleratorMetadata]:
+        """Read agent-reported metadata of the given slots, skipping malformed entries."""
+        reported = await self._valkey_stat.get_computer_metadata(slot_names)
+        metadata: dict[str, AcceleratorMetadata] = {}
+        skipped: list[str] = []
+        for slot_name, raw in reported.items():
+            try:
+                metadata[slot_name] = _ACCELERATOR_METADATA_ADAPTER.validate_json(raw)
+            except ValueError:
+                skipped.append(slot_name)
+        if skipped:
+            log.warning("Skipped malformed reported metadata of slots: {}", ", ".join(skipped))
+        return metadata
 
     async def get_vfolder_types(self, action: GetVfolderTypesAction) -> GetVfolderTypesActionResult:
         """Get available vfolder types."""

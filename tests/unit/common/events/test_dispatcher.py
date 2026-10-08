@@ -87,7 +87,9 @@ class DummyBroadcastEvent(AbstractBroadcastEvent):
         return "test_broadcast"
 
 
-def _make_anycast_mq_message(event: AbstractAnycastEvent) -> MQMessage:
+def _make_anycast_mq_message(
+    event: AbstractAnycastEvent, stream_key: str | None = None
+) -> MQMessage:
     return MQMessage(
         msg_id=b"test-msg-id",
         payload={
@@ -95,6 +97,7 @@ def _make_anycast_mq_message(event: AbstractAnycastEvent) -> MQMessage:
             b"source": b"i-test",
             b"args": msgpack.packb(event.serialize()),
         },
+        stream_key=stream_key,
     )
 
 
@@ -120,6 +123,7 @@ class StubMessageQueue:
         self._anycast_messages = anycast_messages or []
         self._broadcast_messages = broadcast_messages or []
         self.done_calls: list[bytes] = []
+        self.done_stream_keys: list[str | None] = []
 
     async def consume_queue(self) -> AsyncGenerator[MQMessage, None]:
         for msg in self._anycast_messages:
@@ -129,8 +133,9 @@ class StubMessageQueue:
         for msg in self._broadcast_messages:
             yield msg
 
-    async def done(self, msg_id: bytes) -> None:
+    async def done(self, msg_id: bytes, *, stream_key: str | None = None) -> None:
         self.done_calls.append(msg_id)
+        self.done_stream_keys.append(stream_key)
 
     async def close(self) -> None:
         pass
@@ -192,6 +197,50 @@ class TestDispatchConsumers:
         await no_consumer_dispatcher.close()
 
         assert mq.done_calls == [b"test-msg-id"]
+
+
+class TestConsumerAckStream:
+    """The dispatcher acknowledges a message on the stream it was read from."""
+
+    @pytest.fixture
+    def mq(self) -> StubMessageQueue:
+        return StubMessageQueue(
+            anycast_messages=[
+                _make_anycast_mq_message(DummyAnycastEvent(value=1), stream_key="events:agent:x")
+            ],
+        )
+
+    async def test_handled_message_is_acked_once_on_its_stream(
+        self,
+        mq: StubMessageQueue,
+    ) -> None:
+        dispatcher = EventDispatcher(mq)  # type: ignore[arg-type]
+        received: list[DummyAnycastEvent] = []
+
+        async def handler(ctx: object, source: AgentId, ev: DummyAnycastEvent) -> None:
+            received.append(ev)
+
+        dispatcher.consume(DummyAnycastEvent, object(), handler, name="first")
+        dispatcher.consume(DummyAnycastEvent, object(), handler, name="second")
+        await dispatcher.start()
+        await asyncio.sleep(0.1)
+        await dispatcher.close()
+
+        assert len(received) == 2
+        assert mq.done_calls == [b"test-msg-id"]
+        assert mq.done_stream_keys == ["events:agent:x"]
+
+    async def test_message_without_consumer_is_acked_on_its_stream(
+        self,
+        mq: StubMessageQueue,
+    ) -> None:
+        dispatcher = EventDispatcher(mq)  # type: ignore[arg-type]
+        await dispatcher.start()
+        await asyncio.sleep(0.1)
+        await dispatcher.close()
+
+        assert mq.done_calls == [b"test-msg-id"]
+        assert mq.done_stream_keys == ["events:agent:x"]
 
 
 class TestDispatchSubscribers:

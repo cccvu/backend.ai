@@ -10,6 +10,7 @@ from pydantic import (
     ConfigDict,
     Field,
     FilePath,
+    field_validator,
     model_validator,
 )
 
@@ -800,6 +801,66 @@ class StorageProxyConfig(BaseConfigSchema):
             added_version="25.12.0",
         ),
     ]
+    event_stream_key: Annotated[
+        str,
+        Field(
+            default="events",
+            min_length=1,
+            validation_alias=AliasChoices("event-stream-key", "event_stream_key"),
+            serialization_alias="event-stream-key",
+        ),
+        BackendAIConfigMeta(
+            description=(
+                "Redis stream key that this storage proxy sends anycast events to. "
+                "When it is not 'events', the manager must list it in its "
+                "'extra-event-stream-keys' to consume the events. "
+                "A dedicated key lets the stream be restricted to the storage proxy."
+            ),
+            added_version="26.8.4",
+            example=ConfigExample(local="events", prod="events:storage"),
+        ),
+    ]
+    event_channel: Annotated[
+        str,
+        Field(
+            default="events_all",
+            min_length=1,
+            validation_alias=AliasChoices("event-channel", "event_channel"),
+            serialization_alias="event-channel",
+        ),
+        BackendAIConfigMeta(
+            description=(
+                "Redis pub/sub channel that this storage proxy broadcasts events to. "
+                "When it is not 'events_all', the manager must list it in its "
+                "'extra-event-channels' to receive the events."
+            ),
+            added_version="26.8.4",
+            example=ConfigExample(local="events_all", prod="events_all:storage"),
+        ),
+    ]
+    event_subscribe_channels: Annotated[
+        list[str],
+        Field(
+            default=["events_all"],
+            validation_alias=AliasChoices("event-subscribe-channels", "event_subscribe_channels"),
+            serialization_alias="event-subscribe-channels",
+        ),
+        BackendAIConfigMeta(
+            description=(
+                "Redis pub/sub channels that this storage proxy subscribes to for broadcast "
+                "events. An empty list starts no subscriber."
+            ),
+            added_version="26.8.4",
+            example=ConfigExample(local='["events_all"]', prod='["events_all"]'),
+        ),
+    ]
+
+    @field_validator("event_subscribe_channels", mode="after")
+    @classmethod
+    def _validate_event_subscribe_channels(cls, channels: list[str]) -> list[str]:
+        if any(not channel for channel in channels):
+            raise ValueError("event-subscribe-channels must not contain an empty channel name")
+        return channels
 
 
 class PresignedUploadConfig(BaseConfigSchema):

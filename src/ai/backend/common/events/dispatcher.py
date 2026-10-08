@@ -177,10 +177,12 @@ class _ConsumerPostCallback:
         msg_id: MessageId,
         msg_queue: AbstractMessageQueue,
         remaining_handler_cnt: int,
+        stream_key: str | None = None,
     ) -> None:
         self._msg_id = msg_id
         self._msg_queue = msg_queue
         self._remaining_handler_cnt = remaining_handler_cnt
+        self._stream_key = stream_key
         self._lock = asyncio.Lock()
 
     async def done(self) -> None:
@@ -191,7 +193,8 @@ class _ConsumerPostCallback:
             if self._remaining_handler_cnt > 0:
                 return
         # All consumer handlers are called.
-        await self._msg_queue.done(self._msg_id)
+        # Acknowledge on the stream the message was read from.
+        await self._msg_queue.done(self._msg_id, stream_key=self._stream_key)
 
 
 class PostCallback(Protocol):
@@ -584,6 +587,7 @@ class EventDispatcher(EventDispatcherGroup):
             mq_msg.msg_id,
             self._msg_queue,
             len(consumer_handlers) if consumer_handlers else 0,
+            stream_key=mq_msg.stream_key,
         )
         if not consumer_handlers:
             await post_callback.done()

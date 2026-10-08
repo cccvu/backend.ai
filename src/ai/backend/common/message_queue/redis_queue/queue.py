@@ -22,7 +22,7 @@ from ai.backend.common.types import RedisTarget
 from .anycaster import RedisAnycaster
 from .broadcaster import RedisBroadcaster
 from .consumer import RedisConsumer, RedisConsumerArgs
-from .subscriber import RedisSubscriber
+from .subscriber import NoopSubscriber, RedisSubscriber
 
 _DEFAULT_AUTOCLAIM_IDLE_TIMEOUT = 300_000  # 5 minutes
 
@@ -32,7 +32,9 @@ class RedisMQArgs:
     # Required arguments
     anycast_stream_key: str
     broadcast_channel: str
+    # Streams to consume as `group_name`; the group is created on each if missing.
     consume_stream_keys: set[str] | None
+    # Channels to subscribe to; if empty, no subscriber connection is opened.
     subscribe_channels: set[str] | None
     group_name: str
     node_id: str
@@ -96,8 +98,14 @@ class RedisQueue(AbstractMessageQueue):
         )
 
         # Create subscriber
-        subscribe_channels = args.subscribe_channels or set()
-        subscriber = await RedisSubscriber.create(redis_target, subscribe_channels, args.db)
+        # Without channels, do not open a subscriber connection at all.
+        subscriber: AbstractSubscriber
+        if args.subscribe_channels:
+            subscriber = await RedisSubscriber.create(
+                redis_target, args.subscribe_channels, args.db
+            )
+        else:
+            subscriber = NoopSubscriber()
 
         return cls(anycaster, broadcaster, consumer, subscriber)
 
@@ -165,11 +173,11 @@ class RedisQueue(AbstractMessageQueue):
             yield message
 
     @override
-    async def done(self, msg_id: MessageId) -> None:
+    async def done(self, msg_id: MessageId, *, stream_key: str | None = None) -> None:
         """
         Acknowledge that a message has been processed successfully.
         """
-        await self._consumer.done(msg_id)
+        await self._consumer.done(msg_id, stream_key=stream_key)
 
     # Subscriber methods
 

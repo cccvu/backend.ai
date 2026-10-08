@@ -4,12 +4,14 @@ Unit tests for `ai.backend.agent.docker.agent` helpers.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from http import HTTPStatus
-from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from typing import Any, cast
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from aiodocker.exceptions import DockerError
+from cachetools import LRUCache
 
 from ai.backend.agent.config.unified import (
     AgentUnifiedConfig,
@@ -17,11 +19,15 @@ from ai.backend.agent.config.unified import (
     ContainerLogsConfig,
 )
 from ai.backend.agent.docker.agent import (
+    _IMAGE_DISTRO_CACHE_SIZE,
+    DockerAgent,
     DockerKernelCreationContext,
     LogDriverOptions,
     _build_log_config,
     _parse_distro_from_ldd_output,
 )
+from ai.backend.common.docker import LabelName
+from ai.backend.common.types import ImageConfig
 
 LDD_PRELOAD_ERROR_LINES = "\n".join([
     "ERROR: ld.so: object '/opt/kernel/libbaihook.so' from LD_PRELOAD cannot be preloaded"
@@ -347,3 +353,103 @@ class TestBuildLogConfig:
 
         assert dumped == expected
         assert type(dumped["Type"]) is str
+
+
+def _image_config(digest: str, labels: dict[str, str] | None = None) -> ImageConfig:
+    return cast(
+        ImageConfig,
+        {
+            "canonical": "registry.example.com/test/image:latest",
+            "digest": digest,
+            "labels": labels or {},
+        },
+    )
+
+
+class TestResolveImageDistro:
+    @pytest.fixture
+    def stat_client(self) -> MagicMock:
+        # Any use of the shared statistics store would show up as a call on this mock.
+        return MagicMock()
+
+    @pytest.fixture
+    def agent(self, stat_client: MagicMock) -> DockerAgent:
+        agent = DockerAgent.__new__(DockerAgent)
+        agent._image_distro_cache = LRUCache(maxsize=_IMAGE_DISTRO_CACHE_SIZE)
+        agent.valkey_stat_client = stat_client
+        return agent
+
+    @pytest.fixture
+    def probe_container(self) -> MagicMock:
+        container = MagicMock()
+        container.start = AsyncMock()
+        container.wait = AsyncMock()
+        container.log = AsyncMock(return_value=["ldd (GNU libc) 2.35\n"])
+        container.stop = AsyncMock()
+        container.delete = AsyncMock()
+        return container
+
+    @pytest.fixture
+    def docker_cls(self, probe_container: MagicMock) -> Iterator[MagicMock]:
+        docker = MagicMock()
+        docker.containers.create = AsyncMock(return_value=probe_container)
+        docker.__aenter__ = AsyncMock(return_value=docker)
+        docker.__aexit__ = AsyncMock(return_value=None)
+        with patch("ai.backend.agent.docker.agent.Docker", return_value=docker) as docker_cls:
+            yield docker_cls
+
+    async def test_label_wins_without_probing(
+        self, agent: DockerAgent, docker_cls: MagicMock
+    ) -> None:
+        image = _image_config("sha256:aaaa", {LabelName.BASE_DISTRO: "ubuntu24.04"})
+
+        assert await agent.resolve_image_distro(image) == "ubuntu24.04"
+
+        docker_cls.assert_not_called()
+        assert len(agent._image_distro_cache) == 0
+
+    async def test_probe_result_is_reused_in_process(
+        self,
+        agent: DockerAgent,
+        stat_client: MagicMock,
+        docker_cls: MagicMock,
+        probe_container: MagicMock,
+    ) -> None:
+        image = _image_config("sha256:bbbb")
+
+        assert await agent.resolve_image_distro(image) == "ubuntu22.04"
+        assert await agent.resolve_image_distro(image) == "ubuntu22.04"
+
+        docker_cls.assert_called_once()
+        probe_container.start.assert_awaited_once()
+        assert agent._image_distro_cache["bbbb"] == "ubuntu22.04"
+        assert stat_client.mock_calls == []
+
+    async def test_each_digest_is_probed_separately(
+        self,
+        agent: DockerAgent,
+        stat_client: MagicMock,
+        docker_cls: MagicMock,
+        probe_container: MagicMock,
+    ) -> None:
+        agent._image_distro_cache["1234"] = "alpine3.8"
+
+        assert await agent.resolve_image_distro(_image_config("sha256:1234")) == "alpine3.8"
+        docker_cls.assert_not_called()
+
+        assert await agent.resolve_image_distro(_image_config("sha256:dddd")) == "ubuntu22.04"
+        probe_container.start.assert_awaited_once()
+        assert stat_client.mock_calls == []
+
+    async def test_failed_probe_is_not_cached(
+        self,
+        agent: DockerAgent,
+        docker_cls: MagicMock,
+        probe_container: MagicMock,
+    ) -> None:
+        probe_container.log = AsyncMock(return_value=["no libc here\n"])
+
+        with pytest.raises(RuntimeError):
+            await agent.resolve_image_distro(_image_config("sha256:eeee"))
+
+        assert "eeee" not in agent._image_distro_cache

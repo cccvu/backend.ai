@@ -706,7 +706,7 @@ Monitor Valkey operation latency (P95) by layer and operation. This helps identi
 
 ```promql
 histogram_quantile(0.95,
-  sum(rate(backendai_layer_operation_duration_sec_bucket{domain="valkey", operation!~"receive_broadcast_message|read_consumer_group"}[5m])) by (le, layer, operation)
+  sum(rate(backendai_layer_operation_duration_sec_bucket{domain="valkey", operation!~"receive_broadcast_message.*|read_consumer_group"}[5m])) by (le, layer, operation)
 )
 ```
 

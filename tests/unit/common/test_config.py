@@ -3,6 +3,7 @@ from typing import Any
 
 import pytest
 import tomli
+import trafaret as t
 
 from ai.backend.common.config import (
     DEFAULT_SHELL,
@@ -776,3 +777,34 @@ class TestRedisConfigIv:
         assert config["use_tls"] is False
         assert config["tls_skip_verify"] is False
         assert config["tls_ca_file"] is None
+
+
+class TestRedisConfigIvUsername:
+    def test_accepts_username(self) -> None:
+        config = redis_config_iv.check({
+            "addr": "127.0.0.1:6379",
+            "username": "base-user",
+            "password": "secret",
+            "override_configs": {
+                "stream": {"addr": "127.0.0.1:6380", "username": "stream-user"},
+            },
+        })
+        assert config["username"] == "base-user"
+        assert config["override_configs"]["stream"]["username"] == "stream-user"
+
+    def test_no_username_by_default(self) -> None:
+        config = redis_config_iv.check({
+            "addr": "127.0.0.1:6379",
+            "override_configs": {"stream": {"addr": "127.0.0.1:6380"}},
+        })
+        assert config["username"] is None
+        assert config["override_configs"]["stream"]["username"] is None
+
+    def test_rejects_blank_username(self) -> None:
+        with pytest.raises(t.DataError):
+            redis_config_iv.check({"addr": "127.0.0.1:6379", "username": ""})
+        with pytest.raises(t.DataError):
+            redis_config_iv.check({
+                "addr": "127.0.0.1:6379",
+                "override_configs": {"stream": {"addr": "127.0.0.1:6380", "username": ""}},
+            })

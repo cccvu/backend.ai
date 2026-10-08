@@ -39,6 +39,31 @@ class ContainerLogData:
         except Exception as e:
             raise ContainerLogError("Failed to decode or decompress content") from e
 
+    def get_bounded_content(self, max_size: int) -> tuple[bytes, bool]:
+        """
+        Decode the content without producing more than ``max_size`` bytes.
+
+        :param max_size: The maximum number of bytes to return.
+        :return: The (possibly truncated) content and whether it was truncated.
+        :raises ContainerLogError: If the content cannot be decoded or decompressed.
+        """
+        try:
+            decoded = self._decode_base64(self.content)
+            if self.compress_type != ContainerLogType.ZLIB:
+                return decoded[: max(max_size, 0)], len(decoded) > max_size
+            if max_size <= 0:
+                # A zero max_length means "unlimited" to zlib, so never pass it.
+                return b"", bool(decoded)
+            decompressor = zlib.decompressobj()
+            content = decompressor.decompress(decoded, max_size)
+        except Exception as e:
+            raise ContainerLogError("Failed to decode or decompress content") from e
+        if decompressor.eof:
+            return content, False
+        if decompressor.unconsumed_tail or len(content) >= max_size:
+            return content, True
+        raise ContainerLogError("Failed to decompress content: incomplete stream")
+
     def serialize(self) -> bytes:
         try:
             payload = {
@@ -50,7 +75,12 @@ class ContainerLogData:
             raise ContainerLogError("Failed to serialize log data") from e
 
     @classmethod
-    def deserialize(cls, data: bytes) -> "ContainerLogData":
+    def deserialize(cls, data: bytes, max_size: int | None = None) -> "ContainerLogData":
+        """
+        :param max_size: If given, reject serialized data longer than this before parsing it.
+        """
+        if max_size is not None and len(data) > max_size:
+            raise ContainerLogError(f"Serialized log data exceeds {max_size} bytes")
         try:
             obj = json.loads(data.decode("utf-8"))
             return cls(compress_type=ContainerLogType(obj["compress_type"]), content=obj["content"])

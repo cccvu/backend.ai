@@ -850,7 +850,7 @@ class StatContext:
 
             serializable_by_kernel[str(kernel_id)] = serializable_metrics
 
-        # Use ValkeyStatClient set_multiple_keys for batch operations
+        # Store the statistics under keys scoped by this agent's ID in batch
         with self._stage_observer.measure_stage(
             stage=CollectionStage.SERIALIZE, upper_layer=CollectionLayer.CONTAINER
         ):
@@ -862,7 +862,9 @@ class StatContext:
             with self._stage_observer.measure_stage(
                 stage=CollectionStage.REDIS_WRITE, upper_layer=CollectionLayer.CONTAINER
             ):
-                await self.agent.valkey_stat_client.set_multiple_keys(key_value_map)
+                await self.agent.valkey_stat_client.set_kernel_statistics_batch(
+                    self.agent.id, key_value_map
+                )
 
     async def _get_processes(
         self, container_id: ContainerId, docker: aiodocker.Docker

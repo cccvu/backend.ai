@@ -1,4 +1,5 @@
 import asyncio
+import dataclasses
 import logging
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Iterable
@@ -139,6 +140,31 @@ def build_tls_config(
     )
 
 
+def build_server_credentials(
+    *,
+    username: str | None,
+    password: str | None,
+) -> ServerCredentials | None:
+    """
+    Build the glide credentials for a Valkey target.
+
+    Without a username, only the password is sent and the connection authenticates
+    as the server's default user. A username without a password is refused instead
+    of silently connecting without the configured user.
+
+    Raises:
+        InvalidConfigError: If a username is set without a password. The message
+            names neither value.
+    """
+    if not password:
+        if username:
+            raise InvalidConfigError("A Valkey username is configured without a password")
+        return None
+    if not username:
+        return ServerCredentials(password=password)
+    return ServerCredentials(password=password, username=username)
+
+
 @dataclass
 class ValkeyStandaloneTarget:
     address: str
@@ -147,6 +173,7 @@ class ValkeyStandaloneTarget:
     use_tls: bool = False
     tls_skip_verify: bool = False
     tls_ca_file: str | None = None
+    username: str | None = None
 
     @classmethod
     def from_valkey_target(cls, valkey_target: ValkeyTarget) -> Self:
@@ -162,6 +189,7 @@ class ValkeyStandaloneTarget:
             use_tls=valkey_target.use_tls,
             tls_skip_verify=valkey_target.tls_skip_verify,
             tls_ca_file=valkey_target.tls_ca_file,
+            username=valkey_target.username,
         )
 
 
@@ -175,6 +203,7 @@ class ValkeySentinelTarget:
     use_tls: bool = False
     tls_skip_verify: bool = False
     tls_ca_file: str | None = None
+    username: str | None = None
 
     @classmethod
     def from_valkey_target(cls, valkey_target: ValkeyTarget) -> Self:
@@ -196,6 +225,7 @@ class ValkeySentinelTarget:
             use_tls=valkey_target.use_tls,
             tls_skip_verify=valkey_target.tls_skip_verify,
             tls_ca_file=valkey_target.tls_ca_file,
+            username=valkey_target.username,
         )
 
 
@@ -295,8 +325,9 @@ class ValkeyStandaloneClient(AbstractValkeyClient):
         target_host, target_port = addr_to_hostport_pair(self._target.address)
         addresses = [NodeAddress(host=target_host, port=target_port)]
 
-        credentials = (
-            ServerCredentials(password=self._target.password) if self._target.password else None
+        credentials = build_server_credentials(
+            username=self._target.username,
+            password=self._target.password,
         )
 
         config = GlideClientConfiguration(
@@ -394,6 +425,7 @@ class ValkeySentinelClient(AbstractValkeyClient):
 
         # Fall back to master password for backward compatibility when
         # sentinel_password is not explicitly configured.
+        # The username applies to the master only; Sentinel nodes take a password alone.
         sentinel_auth = (
             target.sentinel_password if target.sentinel_password is not None else target.password
         )
@@ -437,8 +469,9 @@ class ValkeySentinelClient(AbstractValkeyClient):
         self._master_address = master_address
 
         addresses = [NodeAddress(host=master_address[0], port=master_address[1])]
-        credentials = (
-            ServerCredentials(password=self._target.password) if self._target.password else None
+        credentials = build_server_credentials(
+            username=self._target.username,
+            password=self._target.password,
         )
 
         config = GlideClientConfiguration(
@@ -582,17 +615,7 @@ def create_valkey_client(
     )
 
     # Create monitor client with fixed 3-second timeout
-    monitor_target = ValkeyTarget(
-        addr=valkey_target.addr,
-        sentinel=valkey_target.sentinel,
-        service_name=valkey_target.service_name,
-        password=valkey_target.password,
-        sentinel_password=valkey_target.sentinel_password,
-        request_timeout=_MONITOR_REQUEST_TIMEOUT,
-        use_tls=valkey_target.use_tls,
-        tls_skip_verify=valkey_target.tls_skip_verify,
-        tls_ca_file=valkey_target.tls_ca_file,
-    )
+    monitor_target = dataclasses.replace(valkey_target, request_timeout=_MONITOR_REQUEST_TIMEOUT)
     monitor_client = _create_valkey_client_internal(
         monitor_target, db_id, f"{human_readable_name}-monitor", None
     )

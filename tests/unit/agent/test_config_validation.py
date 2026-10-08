@@ -1715,3 +1715,104 @@ class TestResourceAllocationModes:
             AgentUnifiedConfig.model_validate(raw_config)
 
         assert "must not be a negative value" in str(exc_info.value)
+
+
+class TestEventRoutingConfig:
+    @pytest.fixture
+    def default_raw_config(self) -> RawConfigT:
+        return {
+            "agent": {
+                "backend": AgentBackend.DOCKER,
+                "rpc-listen-addr": HostPortPair(host="127.0.0.1", port=6001),
+            },
+            "container": {
+                "scratch-type": ScratchType.HOSTDIR,
+                "port-range": [30000, 31000],
+            },
+            "resource": {
+                "reserved-cpu": 1,
+            },
+            "etcd": {
+                "namespace": "test",
+                "addr": HostPortPair(host="127.0.0.1", port=2379),
+            },
+        }
+
+    def test_defaults_are_unchanged(self, default_raw_config: RawConfigT) -> None:
+        config = AgentUnifiedConfig.model_validate(default_raw_config)
+
+        assert config.agent.event_stream_key == "events"
+        assert config.agent.event_channel == "events_all"
+        assert config.agent.event_subscribe_channels == ["events_all"]
+
+    @pytest.mark.parametrize(
+        ("stream_key", "channel", "subscribe"),
+        [
+            ("event-stream-key", "event-channel", "event-subscribe-channels"),
+            ("event_stream_key", "event_channel", "event_subscribe_channels"),
+        ],
+    )
+    def test_kebab_and_snake_aliases(
+        self,
+        default_raw_config: RawConfigT,
+        stream_key: str,
+        channel: str,
+        subscribe: str,
+    ) -> None:
+        raw_config = {
+            **default_raw_config,
+            "agent": {
+                **default_raw_config["agent"],
+                stream_key: "events:agent:a",
+                channel: "events_all:agent:a",
+                subscribe: [],
+            },
+        }
+        config = AgentUnifiedConfig.model_validate(raw_config)
+
+        assert config.agent.event_stream_key == "events:agent:a"
+        assert config.agent.event_channel == "events_all:agent:a"
+        assert config.agent.event_subscribe_channels == []
+
+    @pytest.mark.parametrize(
+        "override",
+        [
+            {"event-stream-key": ""},
+            {"event-channel": ""},
+            {"event-subscribe-channels": ["events_all", ""]},
+        ],
+    )
+    def test_empty_names_are_rejected(
+        self, default_raw_config: RawConfigT, override: dict[str, Any]
+    ) -> None:
+        raw_config = {
+            **default_raw_config,
+            "agent": {**default_raw_config["agent"], **override},
+        }
+        with pytest.raises((BackendAISchemaValidationFailed, ValidationError)):
+            AgentUnifiedConfig.model_validate(raw_config)
+
+    def test_each_agent_can_use_its_own_stream(self, default_raw_config: RawConfigT) -> None:
+        raw_config = {
+            **default_raw_config,
+            "agents": [
+                {
+                    "agent": {
+                        "id": "agent-1",
+                        "event-stream-key": "events:agent:agent-1",
+                        "event-channel": "events_all:agent:agent-1",
+                        "event-subscribe-channels": [],
+                    },
+                },
+                {"agent": {"id": "agent-2"}},
+            ],
+        }
+        config = AgentUnifiedConfig.model_validate(raw_config)
+
+        first, second = config.get_agent_configs()
+        assert first.agent.event_stream_key == "events:agent:agent-1"
+        assert first.agent.event_channel == "events_all:agent:agent-1"
+        assert first.agent.event_subscribe_channels == []
+        assert second.agent.event_stream_key == "events"
+        assert second.agent.event_channel == "events_all"
+        assert second.agent.event_subscribe_channels == ["events_all"]

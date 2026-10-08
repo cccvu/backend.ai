@@ -188,6 +188,8 @@ _SECCOMP_PROFILE_FILENAME: Final[str] = "seccomp.json"
 _SECCOMP_PATH_ENGINES: Final[frozenset[str]] = frozenset({"Podman Engine"})
 # Cached per container, so the capacity is the number of containers an agent may host.
 _CGROUP_PATH_CACHE_SIZE: Final[int] = 2048
+# Cached per image digest, so the capacity is the number of unlabelled images an agent runs.
+_IMAGE_DISTRO_CACHE_SIZE: Final[int] = 256
 
 # Docker splits the configured total container-log size across this many files.
 _CONTAINER_LOG_FILE_COUNT: Final[int] = 5
@@ -1546,6 +1548,7 @@ class DockerAgent(AbstractAgent[DockerKernel, DockerKernelCreationContext]):
     checked_invalid_images: set[str]
     _seccomp_profile_as_path: bool
     _cgroup_path_cache: LRUCache[ContainerId, dict[CgroupController, Path]]
+    _image_distro_cache: LRUCache[str, str]
 
     network_plugin_ctx: NetworkPluginContext
 
@@ -1578,6 +1581,7 @@ class DockerAgent(AbstractAgent[DockerKernel, DockerKernelCreationContext]):
         self.checked_invalid_images = set()
         self._seccomp_profile_as_path = False
         self._cgroup_path_cache = LRUCache(maxsize=_CGROUP_PATH_CACHE_SIZE)
+        self._image_distro_cache = LRUCache(maxsize=_IMAGE_DISTRO_CACHE_SIZE)
         pickle_loader_writer_creator = PickleBasedLoaderWriterCreator.create(
             PickleBasedKernelRegistryCreatorArgs(
                 scratch_root=local_config.container.scratch_root,
@@ -1833,13 +1837,14 @@ class DockerAgent(AbstractAgent[DockerKernel, DockerKernelCreationContext]):
         if distro:
             return distro
 
-        async with Docker() as docker:
-            image_id = image["digest"].partition(":")[-1]
-            # check if distro data is available on redis cache
-            cached_distro = await self.valkey_stat_client.get_image_distro(image_id)
-            if cached_distro:
-                return cached_distro
+        # Probed once per image digest and kept in this process: the result describes the
+        # image on this host, so it is not shared with other agents.
+        image_id = image["digest"].partition(":")[-1]
+        cached_distro = self._image_distro_cache.get(image_id)
+        if cached_distro:
+            return cached_distro
 
+        async with Docker() as docker:
             container_config: dict[str, Any] = {
                 "Image": image["canonical"],
                 "Tty": True,
@@ -1864,8 +1869,8 @@ class DockerAgent(AbstractAgent[DockerKernel, DockerKernelCreationContext]):
             distro = _parse_distro_from_ldd_output(container_log)
             if distro is None:
                 raise RuntimeError("Could not determine the C library variant.")
-            await self.valkey_stat_client.set_image_distro(image_id, distro)
-            return distro
+        self._image_distro_cache[image_id] = distro
+        return distro
 
     @override
     async def scan_images(self) -> ScanImagesResult:

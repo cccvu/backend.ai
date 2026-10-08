@@ -31,6 +31,7 @@ from ai.backend.common.bgtask.types import (
     TaskSubKeyInfo,
     TaskTotalInfo,
     TaskType,
+    bgtask_cache_id,
 )
 from ai.backend.common.clients.valkey_client.valkey_bgtask.client import (
     TaskSetKey,
@@ -48,7 +49,6 @@ from ai.backend.common.events.event_types.bgtask.broadcast import (
     BgtaskPartialSuccessEvent,
     BgtaskUpdatedEvent,
 )
-from ai.backend.common.events.types import EventCacheDomain
 from ai.backend.common.exception import (
     BackendAIError,
     ErrorCode,
@@ -275,6 +275,9 @@ class BackgroundTaskManagerArgs:
     tags: Iterable[str] | None = None
     bgtask_observer: BackgroundTaskObserver | None = None
     task_registry: BackgroundTaskHandlerRegistry | None = None
+    # If set, the events of this manager's tasks are cached under
+    # ``bgtask.<cache_scope>.<task_id>`` instead of ``bgtask.<task_id>``.
+    cache_scope: str | None = None
 
 
 class BackgroundTaskManager:
@@ -285,6 +288,7 @@ class BackgroundTaskManager:
     _valkey_client: ValkeyBgtaskClient
     _task_set_key: TaskSetKey
     _task_registry: BackgroundTaskHandlerRegistry
+    _cache_scope: str | None
 
     _local_cron: LocalCron
 
@@ -293,6 +297,7 @@ class BackgroundTaskManager:
         self._ongoing_tasks = {}
 
         self._valkey_client = args.valkey_client
+        self._cache_scope = args.cache_scope
         self._task_set_key = TaskSetKey(
             server_id=args.server_id, tags=set(args.tags) if args.tags is not None else set()
         )
@@ -300,7 +305,7 @@ class BackgroundTaskManager:
         self._metric_observer = bgtask_observer
         self._hook = CompositeTaskHook([
             MetricObserverHook(bgtask_observer),
-            EventProducerHook(args.event_producer),
+            EventProducerHook(args.event_producer, args.cache_scope),
             ValkeyUnregisterHook(args.valkey_client, self._task_set_key),
         ])
         self._task_registry = args.task_registry or BackgroundTaskHandlerRegistry()
@@ -323,7 +328,7 @@ class BackgroundTaskManager:
     ) -> uuid.UUID:
         task_id = uuid.uuid4()
         await self._event_producer.broadcast_event_with_cache(
-            EventCacheDomain.BGTASK.cache_id(str(task_id)),
+            bgtask_cache_id(task_id, self._cache_scope),
             BgtaskUpdatedEvent(
                 task_id=task_id,
                 message="Task started",
@@ -369,7 +374,7 @@ class BackgroundTaskManager:
         task_id: uuid.UUID,
         **kwargs: Any,
     ) -> BaseBgtaskDoneEvent:
-        reporter = ProgressReporter(self._event_producer, task_id)
+        reporter = ProgressReporter(self._event_producer, task_id, cache_scope=self._cache_scope)
         bgtask_result = await func(reporter, **kwargs)
         return self._convert_bgtask_to_event(task_id, bgtask_result)
 
@@ -436,7 +441,7 @@ class BackgroundTaskManager:
     ) -> None:
         try:
             bgtask_result_event = await self._observe_bgtask(func, task_id, task_name, **kwargs)
-            cache_id = EventCacheDomain.BGTASK.cache_id(str(task_id))
+            cache_id = bgtask_cache_id(task_id, self._cache_scope)
             await self._event_producer.broadcast_event_with_cache(cache_id, bgtask_result_event)
             log.info(
                 "Task {} ({}): {}", task_id, task_name or "", bgtask_result_event.__class__.__name__

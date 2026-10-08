@@ -11,7 +11,6 @@ from typing import Any, cast, override
 from uuid import UUID
 
 import aiotools
-import msgpack
 import sqlalchemy as sa
 from sqlalchemy.engine import CursorResult
 
@@ -64,7 +63,10 @@ from ai.backend.manager.models.rbac_models.association_scopes_entities import (
     AssociationScopesEntitiesRow,
 )
 from ai.backend.manager.models.rbac_models.role import RoleRow
-from ai.backend.manager.models.resource_usage import fetch_resource_usage
+from ai.backend.manager.models.resource_usage import (
+    fetch_resource_usage,
+    parse_kernel_stat_usage,
+)
 from ai.backend.manager.models.routing import RoutingRow
 from ai.backend.manager.models.user import UserRow, users
 from ai.backend.manager.models.utils import ExtendedAsyncSAEngine
@@ -349,20 +351,18 @@ class GroupDBSource:
             result = await conn.execute(query)
             rows = result.fetchall()
 
-        kernel_ids = [str(row.id) for row in rows]
-        raw_stats = await valkey_stat_client.get_user_kernel_statistics_batch(kernel_ids)
+        live_stats = await valkey_stat_client.get_user_kernel_statistics_batch([
+            (row.agent, str(row.id)) for row in rows
+        ])
 
         objs_per_group = {}
         local_tz = config_provider.config.system.timezone
 
-        for row, raw_stat in zip(rows, raw_stats, strict=True):
+        for row, live_stat in zip(rows, live_stats, strict=True):
             group_id = str(row.group_id)
-            last_stat = row.last_stat
-            if not last_stat:
-                if raw_stat is None:
-                    log.warning("stat object for {} not found on redis, skipping", str(row.id))
-                    continue
-                last_stat = msgpack.unpackb(raw_stat)
+            # A kernel without statistics is kept in the report with its allocation;
+            # only its utilization figures are zero.
+            stat_usage = parse_kernel_stat_usage(row.id, row.last_stat or live_stat)
             nfs = None
             if row.vfolder_mounts:
                 # For >=22.03, return used host directories instead of volume host, which is not so useful.
@@ -405,14 +405,14 @@ class GroupDBSource:
                 "full_name": row.full_name,
                 "agent": row.agent,
                 "cpu_allocated": float(row.occupied_slots.get("cpu", 0)),
-                "cpu_used": float(nmget(last_stat, "cpu_used.current", 0)),
+                "cpu_used": stat_usage.cpu_used,
                 "mem_allocated": int(row.occupied_slots.get("mem", 0)),
-                "mem_used": int(nmget(last_stat, "mem.capacity", 0)),
+                "mem_used": stat_usage.mem_used,
                 "shared_memory": int(nmget(row.resource_opts, "shmem", 0)),
                 "disk_allocated": 0,  # TODO: disk quota limit
-                "disk_used": int(nmget(last_stat, "io_scratch_size/stats.max", 0, "/")),
-                "io_read": int(nmget(last_stat, "io_read.current", 0)),
-                "io_write": int(nmget(last_stat, "io_write.current", 0)),
+                "disk_used": stat_usage.disk_used,
+                "io_read": stat_usage.io_read,
+                "io_write": stat_usage.io_write,
                 "used_time": used_time,
                 "used_days": used_days,
                 "device_type": list(device_type),

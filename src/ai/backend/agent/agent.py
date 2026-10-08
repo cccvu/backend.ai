@@ -88,6 +88,7 @@ from ai.backend.agent.tasks import (
 from ai.backend.common import msgpack
 from ai.backend.common.asyncio import cancel_tasks, current_loop
 from ai.backend.common.bgtask.bgtask import BackgroundTaskManager, BackgroundTaskManagerArgs
+from ai.backend.common.bgtask.types import agent_bgtask_cache_scope
 from ai.backend.common.cgroup import CgroupController
 from ai.backend.common.clients.valkey_client.valkey_bgtask.client import ValkeyBgtaskClient
 from ai.backend.common.clients.valkey_client.valkey_container_log.client import (
@@ -1017,6 +1018,7 @@ class AbstractAgent[
                 valkey_client=self.valkey_bgtask_client,
                 server_id=self.id,
                 bgtask_observer=self._metric_registry.bgtask,
+                cache_scope=agent_bgtask_cache_scope(self.id),
             )
         )
         await self.background_task_manager.init()
@@ -1096,13 +1098,12 @@ class AbstractAgent[
         Returns the message queue object.
         """
         node_id = self.id
+        agent_config = self.local_config.agent
         args = RedisMQArgs(
-            anycast_stream_key="events",
-            broadcast_channel="events_all",
+            anycast_stream_key=agent_config.event_stream_key,
+            broadcast_channel=agent_config.event_channel,
             consume_stream_keys=None,
-            subscribe_channels={
-                "events_all",
-            },
+            subscribe_channels=set(agent_config.event_subscribe_channels),
             group_name=EVENT_DISPATCHER_CONSUMER_GROUP,
             node_id=node_id,
             db=REDIS_STREAM_DB,
@@ -1247,6 +1248,7 @@ class AbstractAgent[
             await loop.run_in_executor(None, _map_commit_status)
             # Update kernel commit statuses using ValkeyStatClient
             await self.valkey_stat_client.update_kernel_commit_statuses(
+                self.id,
                 list(commit_kernels),
                 COMMIT_STATUS_EXPIRE,
             )
@@ -1334,6 +1336,7 @@ class AbstractAgent[
                             ContainerLogType.ZLIB, bytes(cb[:chunk_size])
                         )
                         await self.valkey_container_log_client.enqueue_container_logs(
+                            self.id,
                             container_id,
                             chunk_log_item,
                         )
@@ -1354,6 +1357,7 @@ class AbstractAgent[
                     ContainerLogType.ZLIB, chunk_buffer.getvalue()
                 )
                 await self.valkey_container_log_client.enqueue_container_logs(
+                    self.id,
                     container_id,
                     chunk_log_item,
                 )

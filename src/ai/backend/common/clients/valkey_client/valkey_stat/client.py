@@ -1,6 +1,6 @@
 import json
 import logging
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from decimal import Decimal
 from typing import (
     Any,
@@ -9,6 +9,7 @@ from typing import (
     cast,
 )
 
+import msgpack as plain_msgpack
 from glide import (
     Batch,
     ExpirySet,
@@ -54,8 +55,8 @@ valkey_stat_resilience = Resilience(
 )
 
 _DEFAULT_EXPIRATION = 86400  # 24 hours default expiration
-_KERNEL_COMMIT_PREFIX: Final[str] = "kernel"
-_KERNEL_COMMIT_SUFFIX: Final[str] = "commit"
+_KERNEL_STAT_PREFIX: Final[str] = "kstat"
+_KERNEL_COMMIT_PREFIX: Final[str] = "kernel_commit"
 _ABUSE_REPORT_HASH: Final[str] = "abuse_report"
 _CONTAINER_COUNT_PREFIX: Final[str] = "container_count"
 _MANAGER_STATUS_PREFIX: Final[str] = "manager.status"
@@ -195,36 +196,102 @@ class ValkeyStatClient:
         async with self._client.client() as conn:
             await conn.set(key, value, expiry=ExpirySet(ExpiryType.SEC, ttl))
 
-    @valkey_stat_resilience.apply()
-    async def get_kernel_statistics(self, kernel_id: str) -> dict[str, Any] | None:
+    def _get_kernel_stat_key(self, agent_id: str, kernel_id: str) -> str:
         """
-        Get kernel utilization statistics.
+        Generate kernel statistics key, scoped by the ID of the agent hosting the kernel.
 
-        :param kernel_id: The kernel ID.
-        :return: Kernel statistics as dict, or None if not found.
-        """
-        async with self._client.client() as conn:
-            result = await conn.get(str(kernel_id))
-        if result is None:
-            return None
-        try:
-            return cast(dict[str, Any], msgpack.unpackb(result, raw=False))
-        except (ExtraData, UnpackException, ValueError):
-            log.warning(
-                "Failed to unpack kernel statistics for ID {}: {}",
-                kernel_id,
-                result.decode("utf-8"),
-            )
-            return None
-
-    def _get_kernel_commit_key(self, kernel_id: str) -> str:
-        """
-        Generate kernel commit status key.
-
+        :param agent_id: The ID of the agent hosting the kernel.
         :param kernel_id: The kernel ID.
         :return: The generated key.
         """
-        return f"{_KERNEL_COMMIT_PREFIX}.{kernel_id}.{_KERNEL_COMMIT_SUFFIX}"
+        return f"{_KERNEL_STAT_PREFIX}.{agent_id}.{kernel_id}"
+
+    @staticmethod
+    def _decode_kernel_statistics(kernel_id: str, raw: Any) -> dict[str, Any] | None:
+        """
+        Decode a kernel statistics value, returning None if it is missing or malformed.
+        The statistics hold only plain values, so no extension type is decoded.
+
+        :param kernel_id: The kernel ID, for logging.
+        :param raw: The raw value read from Valkey.
+        :return: Kernel statistics as dict, or None.
+        """
+        if not isinstance(raw, bytes):
+            return None
+        try:
+            decoded = plain_msgpack.unpackb(raw, raw=False)
+        except Exception:
+            log.warning(
+                "Failed to unpack kernel statistics for ID {} ({} bytes)", kernel_id, len(raw)
+            )
+            return None
+        if not isinstance(decoded, dict):
+            log.warning("Ignoring kernel statistics for ID {}: not a mapping", kernel_id)
+            return None
+        return cast(dict[str, Any], decoded)
+
+    @valkey_stat_resilience.apply()
+    async def set_kernel_statistics_batch(
+        self,
+        agent_id: str,
+        kernel_stats: Mapping[str, bytes],
+        expire_sec: int | None = None,
+    ) -> None:
+        """
+        Store serialized utilization statistics of the kernels hosted by an agent.
+
+        :param agent_id: The ID of the agent hosting the kernels.
+        :param kernel_stats: Mapping of kernel ID to serialized statistics.
+        :param expire_sec: Expiration time in seconds. If None, uses default expiration.
+        """
+        await self.set_multiple_keys(
+            {
+                self._get_kernel_stat_key(agent_id, kernel_id): value
+                for kernel_id, value in kernel_stats.items()
+            },
+            expire_sec=expire_sec,
+        )
+
+    @valkey_stat_resilience.apply()
+    async def get_kernel_statistics(self, agent_id: str, kernel_id: str) -> dict[str, Any] | None:
+        """
+        Get kernel utilization statistics.
+
+        :param agent_id: The ID of the agent hosting the kernel.
+        :param kernel_id: The kernel ID.
+        :return: Kernel statistics as dict, or None if not found or malformed.
+        """
+        async with self._client.client() as conn:
+            result = await conn.get(self._get_kernel_stat_key(agent_id, str(kernel_id)))
+        return self._decode_kernel_statistics(str(kernel_id), result)
+
+    @valkey_stat_resilience.apply()
+    async def delete_kernel_statistics(self, kernels: Sequence[tuple[str | None, str]]) -> int:
+        """
+        Delete the statistics of the given kernels.
+
+        :param kernels: Sequence of (agent ID, kernel ID) pairs, where the agent ID is
+            that of the agent hosting the kernel (None if it has none).
+        :return: The number of deleted keys.
+        """
+        keys = [
+            self._get_kernel_stat_key(agent_id, kernel_id)
+            for agent_id, kernel_id in kernels
+            if agent_id
+        ]
+        if not keys:
+            return 0
+        return await self.delete(keys)
+
+    def _get_kernel_commit_key(self, agent_id: str, kernel_id: str) -> str:
+        """
+        Generate kernel commit status key, scoped by the ID of the agent hosting the kernel.
+
+        :param agent_id: The ID of the agent hosting the kernel.
+        :param kernel_id: The kernel ID.
+        :return: The generated key.
+        """
+        return f"{_KERNEL_COMMIT_PREFIX}.{agent_id}.{kernel_id}"
 
     def _get_container_count_key(self, agent_id: str) -> str:
         """
@@ -235,19 +302,35 @@ class ValkeyStatClient:
         """
         return f"{_CONTAINER_COUNT_PREFIX}.{agent_id}"
 
+    async def _get_multiple_kernel_keys(
+        self,
+        kernels: Sequence[tuple[str | None, str]],
+        key_builder: Callable[[str, str], str],
+    ) -> list[bytes | None]:
+        """
+        Get the values of agent-scoped kernel keys, with None for kernels without an agent.
+
+        :param kernels: Sequence of (agent ID, kernel ID) pairs.
+        :param key_builder: Builds the key from an agent ID and a kernel ID.
+        :return: List of values, one for each pair.
+        """
+        keys = [key_builder(agent_id, kernel_id) for agent_id, kernel_id in kernels if agent_id]
+        values = iter(await self._get_multiple_keys(keys))
+        return [next(values) if agent_id else None for agent_id, _ in kernels]
+
     @valkey_stat_resilience.apply()
-    async def get_kernel_commit_statuses(self, kernel_ids: list[str]) -> list[bytes | None]:
+    async def get_kernel_commit_statuses(
+        self,
+        kernels: Sequence[tuple[str | None, str]],
+    ) -> list[bytes | None]:
         """
         Get commit statuses for multiple kernels efficiently.
 
-        :param kernel_ids: List of kernel IDs to get commit statuses for.
+        :param kernels: Sequence of (agent ID, kernel ID) pairs, where the agent ID is
+            that of the agent hosting the kernel (None if it has none).
         :return: List of commit status bytes, one for each kernel.
         """
-        if not kernel_ids:
-            return []
-
-        keys = [self._get_kernel_commit_key(kernel_id) for kernel_id in kernel_ids]
-        return await self._get_multiple_keys(keys)
+        return await self._get_multiple_kernel_keys(kernels, self._get_kernel_commit_key)
 
     @valkey_stat_resilience.apply()
     async def get_abuse_report(self, kernel_id: str) -> str | None:
@@ -282,48 +365,23 @@ class ValkeyStatClient:
             )
 
     @valkey_stat_resilience.apply()
-    async def get_session_statistics_batch(
-        self, session_ids: list[str]
+    async def get_user_kernel_statistics_batch(
+        self,
+        kernels: Sequence[tuple[str | None, str]],
     ) -> list[dict[str, Any] | None]:
         """
-        Get statistics for multiple sessions efficiently.
+        Get kernel statistics for multiple kernels for user service operations.
 
-        :param session_ids: List of session IDs to get statistics for.
-        :return: List of session statistics, with None for non-existent sessions.
+        :param kernels: Sequence of (agent ID, kernel ID) pairs, where the agent ID is
+            that of the agent hosting the kernel (None if it has none).
+        :return: List of kernel statistics, with None for kernels whose statistics are
+            missing or malformed.
         """
-        if not session_ids:
-            return []
-
-        results = await self._get_multiple_keys(session_ids)
-        stats: list[dict[str, Any] | None] = []
-        for i, result in enumerate(results):
-            if result is None:
-                stats.append(None)
-                continue
-            try:
-                stats.append(msgpack.unpackb(result))
-            except (
-                ExtraData,
-                UnpackException,
-                ValueError,
-            ):
-                log.warning(
-                    "Failed to unpack session statistics for ID {}: {}",
-                    session_ids[i],
-                    result.decode("utf-8"),
-                )
-                stats.append(None)
-        return stats
-
-    @valkey_stat_resilience.apply()
-    async def get_user_kernel_statistics_batch(self, kernel_ids: list[str]) -> list[bytes | None]:
-        """
-        Get raw kernel statistics for multiple kernels for user service operations.
-
-        :param kernel_ids: List of kernel IDs to get statistics for.
-        :return: List of raw kernel statistics bytes, with None for non-existent kernels.
-        """
-        return await self._get_multiple_keys(kernel_ids)
+        raw_stats = await self._get_multiple_kernel_keys(kernels, self._get_kernel_stat_key)
+        return [
+            self._decode_kernel_statistics(kernel_id, raw)
+            for (_, kernel_id), raw in zip(kernels, raw_stats, strict=True)
+        ]
 
     @valkey_stat_resilience.apply()
     async def get_agent_statistics_batch(self, agent_ids: list[str]) -> list[dict[str, Any] | None]:
@@ -460,45 +518,6 @@ class ValkeyStatClient:
         return stats
 
     @valkey_stat_resilience.apply()
-    async def get_image_distro(self, image_id: str) -> str | None:
-        """
-        Get cached Linux distribution for a Docker image.
-
-        :param image_id: The Docker image ID.
-        :return: The distribution name, or None if not found.
-        """
-        batch = self._create_batch()
-        key = f"image:{image_id}:distro"
-        batch.get(key)
-        batch.expire(key, _DEFAULT_EXPIRATION)
-        async with self._client.client() as conn:
-            results = await conn.exec(batch, raise_on_error=True)
-        if not results:
-            return None
-        try:
-            result = cast(bytes | None, results[0])
-            if not result:
-                return None
-            return result.decode("utf-8")
-        except UnicodeDecodeError:
-            return None
-
-    @valkey_stat_resilience.apply()
-    async def set_image_distro(self, image_id: str, distro: str) -> None:
-        """
-        Cache Linux distribution for a Docker image.
-
-        :param image_id: The Docker image ID.
-        :param distro: The Linux distribution name.
-        """
-        async with self._client.client() as conn:
-            await conn.set(
-                f"image:{image_id}:distro",
-                distro,
-                expiry=ExpirySet(ExpiryType.SEC, _DEFAULT_EXPIRATION),
-            )
-
-    @valkey_stat_resilience.apply()
     async def get_volume_usage(self, proxy_name: str, volume_name: str) -> bytes | None:
         """
         Get volume usage information.
@@ -547,20 +566,23 @@ class ValkeyStatClient:
             )
 
     @valkey_stat_resilience.apply()
-    async def get_computer_metadata(self) -> dict[str, bytes]:
+    async def get_computer_metadata(self, slot_names: Sequence[str]) -> dict[str, bytes]:
         """
-        Get all computer metadata from the hash.
+        Get the computer metadata of the given slots from the hash.
 
-        :return: Dictionary of slot name to metadata JSON string.
+        :param slot_names: The slot names to read.
+        :return: Dictionary of slot name to metadata JSON, for the slots present in the hash.
         """
+        if not slot_names:
+            return {}
+        fields = list(slot_names)
         async with self._client.client() as conn:
-            result = await conn.hgetall(_COMPUTER_METADATA_KEY)
-        # Convert bytes keys and values to strings
-        metadata: dict[str, bytes] = {}
-        for key, value in result.items():
-            str_key: str = key.decode("utf-8")
-            metadata[str_key] = value
-        return metadata
+            values = await conn.hmget(_COMPUTER_METADATA_KEY, cast(list[str | bytes], fields))
+        return {
+            slot_name: value
+            for slot_name, value in zip(fields, values, strict=True)
+            if value is not None
+        }
 
     @valkey_stat_resilience.apply()
     async def _get_raw(self, key: str) -> bytes | None:
@@ -905,12 +927,14 @@ class ValkeyStatClient:
     @valkey_stat_resilience.apply()
     async def update_kernel_commit_statuses(
         self,
+        agent_id: str,
         kernel_ids: list[str],
         expire_sec: int,
     ) -> None:
         """
         Update kernel commit statuses with expiration.
 
+        :param agent_id: The ID of the agent hosting the kernels.
         :param kernel_ids: List of kernel IDs to update.
         :param expire_sec: Expiration time in seconds.
         """
@@ -921,7 +945,7 @@ class ValkeyStatClient:
         batch = self._create_batch()
 
         for kernel_id in kernel_ids:
-            key = f"kernel.{kernel_id}.commit"
+            key = self._get_kernel_commit_key(agent_id, kernel_id)
             batch.set(
                 key=key,
                 value=b"ongoing",

@@ -1546,38 +1546,42 @@ async def service_discovery_ctx(
     agent_server: AgentRPCServer,
 ) -> AsyncGenerator[None]:
     local_config = agent_server.local_config
+    sd_config = local_config.service_discovery
     announce_internal_addr = local_config.agent_common.announce_internal_addr.to_legacy()
-    sd_type = ServiceDiscoveryType(local_config.service_discovery.type)
-    service_discovery: ServiceDiscovery
-    match sd_type:
-        case ServiceDiscoveryType.ETCD:
-            service_discovery = ETCDServiceDiscovery(ETCDServiceDiscoveryArgs(etcd))
-        case ServiceDiscoveryType.REDIS:
-            await agent_server.read_agent_config()
-            if not local_config.redis:
-                raise ConfigurationError({"server_main": "Redis runtime configuration is missing."})
-            valkey_profile_target = local_config.redis.to_valkey_profile_target()
-            live_valkey_target = valkey_profile_target.profile_target(RedisRole.LIVE)
-            service_discovery = await RedisServiceDiscovery.create(
-                args=RedisServiceDiscoveryArgs(valkey_target=live_valkey_target)
-            )
-    sd_loop = ServiceDiscoveryLoop(
-        sd_type,
-        service_discovery,
-        ServiceMetadata(
-            display_name=f"agent-{local_config.agent_default.defaulted_id}",  # defaults to instance id
-            service_group="agent",
-            version=VERSION,
-            endpoint=ServiceEndpoint(
-                address=str(announce_internal_addr),
-                port=announce_internal_addr.port,
-                protocol="http",
-                prometheus_address=str(announce_internal_addr),
-            ),
+    sd_metadata = ServiceMetadata(
+        display_name=f"agent-{local_config.agent_default.defaulted_id}",  # defaults to instance id
+        service_group="agent",
+        version=VERSION,
+        endpoint=ServiceEndpoint(
+            address=str(announce_internal_addr),
+            port=announce_internal_addr.port,
+            protocol="http",
+            prometheus_address=str(announce_internal_addr),
         ),
     )
+    sd_loop: ServiceDiscoveryLoop | None = None
+    if sd_config.enabled:
+        sd_type = ServiceDiscoveryType(sd_config.type)
+        service_discovery: ServiceDiscovery
+        match sd_type:
+            case ServiceDiscoveryType.ETCD:
+                service_discovery = ETCDServiceDiscovery(ETCDServiceDiscoveryArgs(etcd))
+            case ServiceDiscoveryType.REDIS:
+                await agent_server.read_agent_config()
+                if not local_config.redis:
+                    raise ConfigurationError({
+                        "server_main": "Redis runtime configuration is missing."
+                    })
+                valkey_profile_target = local_config.redis.to_valkey_profile_target()
+                live_valkey_target = valkey_profile_target.profile_target(RedisRole.LIVE)
+                service_discovery = await RedisServiceDiscovery.create(
+                    args=RedisServiceDiscoveryArgs(valkey_target=live_valkey_target)
+                )
+        sd_loop = ServiceDiscoveryLoop(sd_type, service_discovery, sd_metadata)
+    else:
+        log.info("service discovery is disabled; skipping the agent's registration")
     if local_config.otel.enabled:
-        meta = sd_loop.metadata
+        meta = sd_metadata
         otel_spec = OpenTelemetrySpec(
             service_name=meta.service_group,
             service_version=meta.version,
@@ -1591,9 +1595,8 @@ async def service_discovery_ctx(
         BraceStyleAdapter.apply_otel(otel_spec)
 
     # Start event-based SD publishing if config has service_group set
-    sd_config = local_config.service_discovery
     sd_event_publisher: ServiceDiscoveryEventPublisher | None = None
-    if sd_config.service_group:
+    if sd_config.enabled and sd_config.service_group:
         from datetime import UTC, datetime
 
         default_agent = agent_server.runtime.get_agent(None)
@@ -1610,7 +1613,8 @@ async def service_discovery_ctx(
     finally:
         if sd_event_publisher is not None:
             await sd_event_publisher.stop()
-        sd_loop.close()
+        if sd_loop is not None:
+            sd_loop.close()
 
 
 @aiotools.server_context

@@ -1203,6 +1203,44 @@ class ManagerConfig(BaseConfigSchema):
             example=ConfigExample(local="false", prod="false"),
         ),
     ]
+    extra_event_stream_keys: Annotated[
+        list[str],
+        Field(
+            default_factory=list,
+            validation_alias=AliasChoices("extra-event-stream-keys", "extra_event_stream_keys"),
+            serialization_alias="extra-event-stream-keys",
+        ),
+        BackendAIConfigMeta(
+            description=(
+                "Additional Redis stream keys to consume anycast events from, besides 'events'. "
+                "List here the 'event-stream-key' of every agent or storage proxy that does "
+                "not use the default stream. The 'events' stream is always consumed."
+            ),
+            added_version="26.8.4",
+            example=ConfigExample(
+                local="[]", prod='["events:agent:agent-prod-001", "events:storage"]'
+            ),
+        ),
+    ]
+    extra_event_channels: Annotated[
+        list[str],
+        Field(
+            default_factory=list,
+            validation_alias=AliasChoices("extra-event-channels", "extra_event_channels"),
+            serialization_alias="extra-event-channels",
+        ),
+        BackendAIConfigMeta(
+            description=(
+                "Additional Redis pub/sub channels to receive broadcast events from, besides "
+                "'events_all'. List here the 'event-channel' of every agent or storage proxy "
+                "that does not use the default channel. 'events_all' is always subscribed."
+            ),
+            added_version="26.8.4",
+            example=ConfigExample(
+                local="[]", prod='["events_all:agent:agent-prod-001", "events_all:storage"]'
+            ),
+        ),
+    ]
     status_update_interval: Annotated[
         float | None,
         Field(
@@ -1291,6 +1329,13 @@ class ManagerConfig(BaseConfigSchema):
                 f'RPC authentication keypair file does not exist: "{v}".',
             )
         return v
+
+    @field_validator("extra_event_stream_keys", "extra_event_channels", mode="after")
+    @classmethod
+    def _validate_extra_event_names(cls, names: list[str]) -> list[str]:
+        if any(not name for name in names):
+            raise ValueError("Event stream keys and channels must not be empty")
+        return names
 
 
 # Deprecated: v20.09

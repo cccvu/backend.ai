@@ -1,5 +1,6 @@
 import logging
 from io import BytesIO
+from typing import Final
 
 import sqlalchemy as sa
 
@@ -18,6 +19,7 @@ from ai.backend.common.events.event_types.kernel.anycast import (
     KernelTerminatedAnycastEvent,
     KernelTerminatingAnycastEvent,
 )
+from ai.backend.common.log.types import ContainerLogError
 from ai.backend.common.types import (
     AgentId,
 )
@@ -31,6 +33,14 @@ from ai.backend.manager.registry import AgentRegistry
 from ai.backend.manager.sokovan.scheduler.coordinator import ScheduleCoordinator
 
 log = BraceStyleAdapter(logging.getLogger(__spec__.name))
+
+# The maximum size of a container log kept in the database.
+MAX_CONTAINER_LOG_SIZE: Final = 10 * 1024 * 1024
+# The maximum number of stored chunks read for one container.
+MAX_CONTAINER_LOG_CHUNKS: Final = 16 * 1024
+# The maximum size of one stored chunk: a base64-encoded chunk of up to
+# MAX_CONTAINER_LOG_SIZE bytes plus the serialization overhead.
+MAX_CONTAINER_LOG_ELEMENT_SIZE: Final = MAX_CONTAINER_LOG_SIZE * 4 // 3 + 64 * 1024
 
 
 class KernelEventHandler:
@@ -60,27 +70,46 @@ class KernelEventHandler:
     async def handle_kernel_log(
         self,
         _context: None,
-        _source: AgentId,
+        source: AgentId,
         event: DoSyncKernelLogsEvent,
     ) -> None:
-        # The log data is at most 10 MiB.
-        log_buffer = BytesIO()
         try:
-            list_size = await self._valkey_container_log.container_log_len(
-                container_id=event.container_id
-            )
-            for _ in range(list_size):
-                # Read chunk-by-chunk to allow interleaving with other Redis operations.
-                chunks = await self._valkey_container_log.pop_container_logs(
-                    container_id=event.container_id
+            async with self._db.begin_readonly() as conn:
+                query = sa.select(kernels.c.agent, kernels.c.container_id).where(
+                    kernels.c.id == event.kernel_id
                 )
-                if chunks is None:  # maybe missing
-                    log_buffer.write(b"(container log unavailable)\n")
-                    break
-                for chunk in chunks:
-                    log_buffer.write(chunk.get_content())
+                row = (await conn.execute(query)).first()
+        except Exception:
+            log.exception("handle_kernel_log: failed to load kernel {}", event.kernel_id)
+            return
+        if row is None or row.agent is None:
+            log.warning("handle_kernel_log: kernel {} has no agent to sync from", event.kernel_id)
+            return
+        # A kernel that failed to start has no container recorded, but its agent still sends
+        # the container's logs: take the container from the event then. The key stays scoped by
+        # the kernel's agent, so only that agent's own logs are ever read.
+        recorded = row.container_id is not None
+        if (
+            row.agent != source
+            or not event.container_id
+            or (recorded and row.container_id != event.container_id)
+        ):
+            log.warning(
+                "handle_kernel_log: ignoring logs of kernel {} sent by agent {} "
+                "(kernel agent: {}, container recorded: {}, container matches: {})",
+                event.kernel_id,
+                source,
+                row.agent,
+                recorded,
+                row.container_id == event.container_id,
+            )
+            return
+        # The agent part of the key comes from the kernel row, never from the event.
+        agent_id = AgentId(row.agent)
+        container_id = str(row.container_id if recorded else event.container_id)
+        try:
             try:
-                log_data = log_buffer.getvalue()
+                log_data = await self._read_container_logs(agent_id, container_id)
 
                 async def _update_log() -> None:
                     async with self._db.begin() as conn:
@@ -93,13 +122,58 @@ class KernelEventHandler:
 
                 await execute_with_retry(_update_log)
             finally:
-                # Clear the log data from Redis when done.
+                # Clear the log data from Redis on every path, so a bad list never outlives
+                # one attempt.
                 await self._valkey_container_log.clear_container_logs(
-                    container_id=event.container_id
+                    agent_id=agent_id,
+                    container_id=container_id,
                 )
         except Exception:
             # skip all exception in handle_kernel_log
-            pass
+            log.warning("handle_kernel_log: failed to sync logs of kernel {}", event.kernel_id)
+
+    async def _read_container_logs(self, agent_id: AgentId, container_id: str) -> bytes:
+        """
+        Pop the stored log chunks of a container.
+
+        At most MAX_CONTAINER_LOG_CHUNKS chunks are read and at most MAX_CONTAINER_LOG_SIZE
+        bytes are kept; the rest is dropped with a marker.
+        """
+        log_buffer = BytesIO()
+        try:
+            list_size = await self._valkey_container_log.container_log_len(
+                agent_id=agent_id,
+                container_id=container_id,
+            )
+            truncated = list_size > MAX_CONTAINER_LOG_CHUNKS
+            num_chunks = min(list_size, MAX_CONTAINER_LOG_CHUNKS)
+            for index in range(num_chunks):
+                remaining = MAX_CONTAINER_LOG_SIZE - log_buffer.tell()
+                # Read chunk-by-chunk to allow interleaving with other Redis operations.
+                try:
+                    chunks = await self._valkey_container_log.pop_container_logs(
+                        agent_id=agent_id,
+                        container_id=container_id,
+                        max_element_size=MAX_CONTAINER_LOG_ELEMENT_SIZE,
+                    )
+                    if chunks is None:  # maybe missing
+                        log_buffer.write(b"(container log unavailable)\n")
+                        break
+                    for chunk in chunks:
+                        content, chunk_truncated = chunk.get_bounded_content(remaining)
+                        log_buffer.write(content)
+                        remaining -= len(content)
+                        truncated = truncated or chunk_truncated
+                except ContainerLogError:
+                    log.warning("skipping an unreadable log chunk of container {}", container_id)
+                    continue
+                if remaining <= 0:
+                    # The rest is dropped with the key.
+                    truncated = truncated or index + 1 < num_chunks
+                    break
+            if truncated:
+                log_buffer.write(b"(container log truncated)\n")
+            return log_buffer.getvalue()
         finally:
             log_buffer.close()
 

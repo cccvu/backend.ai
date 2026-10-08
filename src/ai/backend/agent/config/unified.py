@@ -1319,10 +1319,71 @@ class OverridableAgentConfig(BaseConfigSchema):
             composite=CompositeType.FIELD,
         ),
     ]
+    event_stream_key: Annotated[
+        str,
+        Field(
+            default="events",
+            min_length=1,
+            validation_alias=AliasChoices("event-stream-key", "event_stream_key"),
+            serialization_alias="event-stream-key",
+        ),
+        BackendAIConfigMeta(
+            description=(
+                "Redis stream key that this agent sends anycast events to. "
+                "When it is not 'events', the manager must list it in its "
+                "'extra-event-stream-keys' to consume the events. "
+                "A per-agent key lets the stream be restricted to this agent."
+            ),
+            added_version="26.8.4",
+            example=ConfigExample(local="events", prod="events:agent:agent-prod-001"),
+        ),
+    ]
+    event_channel: Annotated[
+        str,
+        Field(
+            default="events_all",
+            min_length=1,
+            validation_alias=AliasChoices("event-channel", "event_channel"),
+            serialization_alias="event-channel",
+        ),
+        BackendAIConfigMeta(
+            description=(
+                "Redis pub/sub channel that this agent broadcasts events to. "
+                "When it is not 'events_all', the manager must list it in its "
+                "'extra-event-channels' to receive the events."
+            ),
+            added_version="26.8.4",
+            example=ConfigExample(local="events_all", prod="events_all:agent:agent-prod-001"),
+        ),
+    ]
+    event_subscribe_channels: Annotated[
+        list[str],
+        Field(
+            default=["events_all"],
+            validation_alias=AliasChoices("event-subscribe-channels", "event_subscribe_channels"),
+            serialization_alias="event-subscribe-channels",
+        ),
+        BackendAIConfigMeta(
+            description=(
+                "Redis pub/sub channels that this agent subscribes to for broadcast events. "
+                "An empty list starts no subscriber, for an agent that does not need "
+                "broadcast events such as volume mount requests."
+            ),
+            added_version="26.8.4",
+            example=ConfigExample(local='["events_all"]', prod="[]"),
+        ),
+    ]
 
     model_config = ConfigDict(
         extra="allow",
     )
+
+    @field_validator("event_subscribe_channels", mode="after")
+    @classmethod
+    def _validate_event_subscribe_channels(cls, channels: list[str]) -> list[str]:
+        if any(not channel for channel in channels):
+            raise ValueError("event-subscribe-channels must not contain an empty channel name")
+        return channels
 
     @model_validator(mode="before")
     @classmethod

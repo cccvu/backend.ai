@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock
 
-from ai.backend.common.types import KernelId
+from ai.backend.common.types import AgentId, KernelId
 from ai.backend.manager.data.kernel.types import KernelInfo
 from ai.backend.manager.sokovan.recorder import RecorderContext
 from ai.backend.manager.sokovan.scheduler.terminator.terminator import SessionTerminator
@@ -360,6 +360,29 @@ class TestSessionTerminatorStaleDetection:
         # Agent check should not be called
         mock_client = mock_agent_client_pool._mock_client
         mock_client.check_running.assert_not_awaited()
+
+    async def test_presence_read_with_agents_from_kernel_records(
+        self,
+        terminator: SessionTerminator,
+        mock_valkey_schedule: AsyncMock,
+        running_kernels_multiple: list[KernelInfo],
+        running_kernel_no_agent: KernelInfo,
+    ) -> None:
+        """Presence keys are built from each kernel's recorded agent; kernels without
+        an agent are not looked up."""
+        mock_valkey_schedule.check_kernel_presence_status_batch.return_value = {}
+
+        await terminator.check_stale_kernels([*running_kernels_multiple, running_kernel_no_agent])
+
+        expected = {
+            KernelId(k.id): AgentId(k.resource.agent)
+            for k in running_kernels_multiple
+            if k.resource.agent
+        }
+        mock_valkey_schedule.check_kernel_presence_status_batch.assert_awaited_once_with(
+            expected,
+            agent_ids={AgentId("agent-1"), AgentId("agent-2")},
+        )
 
     async def test_empty_kernel_list_returns_empty(
         self,

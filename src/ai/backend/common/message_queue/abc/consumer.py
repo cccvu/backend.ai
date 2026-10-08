@@ -29,15 +29,18 @@ class AbstractConsumer(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    async def done(self, msg_id: MessageId) -> None:
+    async def done(self, msg_id: MessageId, *, stream_key: str | None = None) -> None:
         """
         Acknowledge that a message has been processed successfully.
 
         Args:
             msg_id: The message identifier to acknowledge
+            stream_key: The stream the message was read from (`MQMessage.stream_key`).
+                It may be omitted only when exactly one stream is consumed.
 
         Raises:
             RuntimeError: If the component is closed
+            ValueError: If the stream cannot be determined or is not consumed
         """
         raise NotImplementedError
 

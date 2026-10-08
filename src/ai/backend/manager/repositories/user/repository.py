@@ -7,7 +7,6 @@ from decimal import Decimal
 from typing import Any
 from uuid import UUID
 
-import msgpack
 from dateutil.tz import tzutc
 
 from ai.backend.common.clients.valkey_client.valkey_stat.client import ValkeyStatClient
@@ -475,19 +474,22 @@ class UserRepository:
         ]
 
         # Valkey batch fetch
-        kernel_ids = [str(row.id) for row in rows]
-        raw_stats = await valkey_stat_client.get_user_kernel_statistics_batch(kernel_ids)
+        live_stats = await valkey_stat_client.get_user_kernel_statistics_batch([
+            (row.agent, str(row.id)) for row in rows
+        ])
 
-        for row, raw_stat in zip(rows, raw_stats, strict=True):
-            if raw_stat is not None:
-                last_stat = msgpack.unpackb(raw_stat)
-                io_read_byte = int(nmget(last_stat, "io_read.current", 0))
-                io_write_byte = int(nmget(last_stat, "io_write.current", 0))
-                disk_used = int(nmget(last_stat, "io_scratch_size.stats.max", 0, "/"))
-            else:
-                io_read_byte = 0
-                io_write_byte = 0
-                disk_used = 0
+        for row, live_stat in zip(rows, live_stats, strict=True):
+            io_read_byte = 0
+            io_write_byte = 0
+            disk_used = 0
+            if live_stat is not None:
+                try:
+                    io_read_byte = int(nmget(live_stat, "io_read.current", 0))
+                    io_write_byte = int(nmget(live_stat, "io_write.current", 0))
+                    disk_used = int(nmget(live_stat, "io_scratch_size.stats.max", 0, "/"))
+                except (TypeError, ValueError, ArithmeticError):
+                    log.warning("Ignoring malformed statistics of kernel {}", row.id)
+                    io_read_byte = io_write_byte = disk_used = 0
 
             occupied_slots: Mapping[str, Any] = row.occupied_slots
             kernel_created_at: float = row.created_at.timestamp()

@@ -11,7 +11,7 @@ from uuid import uuid4
 import pytest
 
 from ai.backend.common import msgpack
-from ai.backend.common.types import KernelId, SessionId, SessionTypes
+from ai.backend.common.types import AgentId, KernelId, SessionId, SessionTypes
 from ai.backend.manager.idle import (
     IdleCheckerArgs,
     NetworkTimeoutIdleChecker,
@@ -849,6 +849,7 @@ class TestUtilizationIdleChecker:
         current_test_config: _UtilizationCurrentTestConfig,
         utilization_current_checker: UtilizationIdleChecker,
         utilization_kernel_id: KernelId,
+        valkey_stat: AsyncMock,
     ) -> None:
         """Test getting current utilization"""
         # Given
@@ -862,12 +863,44 @@ class TestUtilizationIdleChecker:
 
         # When
         utilization = await utilization_current_checker.get_current_utilization(
-            [utilization_kernel_id],
+            [(utilization_kernel_id, AgentId("i-test"))],
             memory_slots,
         )
 
         # Then
         assert utilization == expected_utilization
+        valkey_stat.get_kernel_statistics.assert_awaited_once_with(
+            "i-test", str(utilization_kernel_id)
+        )
+
+    @pytest.mark.parametrize(
+        "current_test_config",
+        [
+            _UtilizationCurrentTestConfig(
+                mem_current=7.0,
+                mem_pct=70.0,
+                cpu_util_pct=10.0,
+                mem_slots=Decimal(10.0),
+                expected_cpu_util=10.0,
+                expected_mem_util=70.0,
+            ),
+        ],
+    )
+    async def test_utilization_current_kernel_without_agent(
+        self,
+        current_test_config: _UtilizationCurrentTestConfig,
+        utilization_current_checker: UtilizationIdleChecker,
+        utilization_kernel_id: KernelId,
+        valkey_stat: AsyncMock,
+    ) -> None:
+        """A kernel without an agent has no statistics to read."""
+        utilization = await utilization_current_checker.get_current_utilization(
+            [(utilization_kernel_id, None)],
+            {"mem": current_test_config.mem_slots},
+        )
+
+        assert utilization is None
+        valkey_stat.get_kernel_statistics.assert_not_awaited()
 
     # Test 2: Grace period test
     @pytest.fixture
@@ -1163,6 +1196,7 @@ class TestUtilizationIdleChecker:
         """Kernel row for utilization tests"""
         return mock_row(
             id=utilization_kernel_id,
+            agent=AgentId("i-test"),
             session_id=session_id,
             created_at=base_time,
             cluster_size=1,

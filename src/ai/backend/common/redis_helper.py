@@ -20,7 +20,6 @@ from glide import (
     GlideClient,
     GlideClientConfiguration,
     NodeAddress,
-    ServerCredentials,
 )
 from redis.asyncio import BlockingConnectionPool, ConnectionPool, Redis
 from redis.asyncio.client import Pipeline
@@ -28,7 +27,11 @@ from redis.asyncio.sentinel import MasterNotFoundError, Sentinel, SlaveNotFoundE
 from redis.backoff import ExponentialBackoff
 from redis.retry import Retry
 
-from ai.backend.common.clients.valkey_client.client import build_tls_config
+from ai.backend.common.clients.valkey_client.client import (
+    build_server_credentials,
+    build_tls_config,
+)
+from ai.backend.common.exception import InvalidConfigError
 from ai.backend.common.utils import addr_to_hostport_pair
 from ai.backend.logging import BraceStyleAdapter
 
@@ -204,6 +207,14 @@ def _get_ssl_conn_opts(redis_target: RedisTarget) -> dict[str, Any]:
     }
 
 
+def _check_credentials(redis_target: RedisTarget) -> None:
+    """
+    Refuses a username without a password, as ``build_server_credentials`` does for glide.
+    """
+    if redis_target.get("username") and not redis_target.get("password"):
+        raise InvalidConfigError("A Redis username is configured without a password")
+
+
 def _parse_redis_url(redis_target: RedisTarget, db: int) -> yarl.URL:
     redis_url = redis_target.addr
     if redis_url is None:
@@ -212,7 +223,7 @@ def _parse_redis_url(redis_target: RedisTarget, db: int) -> yarl.URL:
     schema = _get_redis_url_schema(redis_target)
     return yarl.URL(f"{schema}://host").with_host(str(redis_url[0])).with_port(
         redis_url[1]
-    ).with_password(redis_target.get("password")) / str(db)
+    ).with_user(redis_target.get("username")).with_password(redis_target.get("password")) / str(db)
 
 
 def get_redis_object(
@@ -226,6 +237,7 @@ def get_redis_object(
     Legacy function kept for external code that depends on the common package.
     Not used in the current codebase.
     """
+    _check_credentials(redis_target)
     redis_helper_config: RedisHelperConfig = cast(
         RedisHelperConfig, redis_target.redis_helper_config
     )
@@ -254,6 +266,7 @@ def get_redis_object(
             sentinel_addresses = _sentinel_addresses
 
         service_name = redis_target.get("service_name")
+        username = redis_target.get("username")
         password = redis_target.get("password")
         sentinel_password = redis_target.get("sentinel_password")
         sentinel_auth = sentinel_password if sentinel_password is not None else password
@@ -268,6 +281,7 @@ def get_redis_object(
         }
         sentinel = Sentinel(
             [(str(host), port) for host, port in sentinel_addresses],
+            username=username,
             password=password,
             db=str(db),
             sentinel_kwargs=sentinel_conn_kwargs,
@@ -275,6 +289,7 @@ def get_redis_object(
         return RedisConnectionInfo(
             client=sentinel.master_for(
                 service_name=service_name,
+                username=username,
                 password=password,
                 **conn_opts,
             ),
@@ -314,6 +329,7 @@ def get_redis_object_for_lock(
     Create a Redis connection using BlockingConnectionPool for distributed locking.
     Uses `connection_ready_timeout` from redis_helper_config as the blocking timeout.
     """
+    _check_credentials(redis_target)
     redis_helper_config: RedisHelperConfig = cast(
         RedisHelperConfig, redis_target.redis_helper_config
     )
@@ -344,6 +360,7 @@ def get_redis_object_for_lock(
             sentinel_addresses = _sentinel_addresses
 
         service_name = redis_target.get("service_name")
+        username = redis_target.get("username")
         password = redis_target.get("password")
         sentinel_password = redis_target.get("sentinel_password")
         sentinel_auth = sentinel_password if sentinel_password is not None else password
@@ -358,6 +375,7 @@ def get_redis_object_for_lock(
         }
         sentinel = Sentinel(
             [(str(host), port) for host, port in sentinel_addresses],
+            username=username,
             password=password,
             db=str(db),
             sentinel_kwargs=sentinel_conn_kwargs,
@@ -365,6 +383,7 @@ def get_redis_object_for_lock(
         return RedisConnectionInfo(
             client=sentinel.master_for(
                 service_name=service_name,
+                username=username,
                 password=password,
                 **conn_opts,
             ),
@@ -410,11 +429,10 @@ async def create_valkey_client(
             host, port = addr_to_hostport_pair(address)
             addresses.append(NodeAddress(host=str(host), port=int(port)))
 
-    credentials: ServerCredentials | None = None
-    if valkey_target.password:
-        credentials = ServerCredentials(
-            password=valkey_target.password,
-        )
+    credentials = build_server_credentials(
+        username=valkey_target.username,
+        password=valkey_target.password,
+    )
     pubsub_subscriptions: GlideClientConfiguration.PubSubSubscriptions | None = None
     if pubsub_channels is not None:
         pubsub_subscriptions = GlideClientConfiguration.PubSubSubscriptions(

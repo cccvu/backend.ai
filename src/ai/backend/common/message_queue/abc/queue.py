@@ -109,6 +109,8 @@ class AbstractMessageQueue(ABC):
     async def done(
         self,
         msg_id: MessageId,
+        *,
+        stream_key: str | None = None,
     ) -> None:
         """
         Acknowledge the message.
@@ -116,6 +118,10 @@ class AbstractMessageQueue(ABC):
         This method should be called after the message is processed.
         If the consumer does not call `done`, the message will be re-delivered after the
         some timeout period.
+
+        Pass the message's `stream_key` so that it is acknowledged on the stream it was
+        read from. It may be omitted only when exactly one stream is consumed;
+        otherwise ValueError is raised.
         """
         raise NotImplementedError
 

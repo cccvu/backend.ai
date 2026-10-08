@@ -4,7 +4,7 @@ from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
-from ai.backend.common.types import SessionId
+from ai.backend.common.types import AgentId, KernelId, SessionId
 
 if TYPE_CHECKING:
     from ai.backend.common.clients.valkey_client.valkey_live.client import ValkeyLiveClient
@@ -22,11 +22,16 @@ class KernelStatistics:
     async def batch_load_by_kernel_impl(
         cls,
         valkey_stat_client: ValkeyStatClient,
-        session_ids: Sequence[SessionId],
+        kernels: Sequence[tuple[KernelId, AgentId | None]],
     ) -> Sequence[Mapping[str, Any] | None]:
-        """For cases where required to collect kernel metrics in bulk internally."""
-        session_ids_str = [str(sess_id) for sess_id in session_ids]
-        return await valkey_stat_client.get_session_statistics_batch(session_ids_str)
+        """
+        For cases where required to collect kernel metrics in bulk internally.
+
+        :param kernels: Sequence of (kernel ID, ID of the agent hosting it) pairs.
+        """
+        return await valkey_stat_client.get_user_kernel_statistics_batch([
+            (agent_id, str(kernel_id)) for kernel_id, agent_id in kernels
+        ])
 
     @classmethod
     async def batch_load_inference_metrics_by_kernel(

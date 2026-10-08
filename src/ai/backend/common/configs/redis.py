@@ -147,6 +147,22 @@ class SingleRedisConfig(BackendAISchema):
             example=ConfigExample(local="mymaster", prod="backend-ai"),
         ),
     ]
+    username: Annotated[
+        str | None,
+        Field(default=None),
+        BackendAIConfigMeta(
+            description=(
+                "ACL user to authenticate as on the Redis master. "
+                "If None, the server's default user is used. "
+                "Requires password. Sentinel nodes are still authenticated with "
+                "sentinel_password (or password) only. "
+                "Override configurations do not inherit it: each one authenticates "
+                "only with its own username and password."
+            ),
+            added_version="26.8.4",
+            example=ConfigExample(local="", prod="backend-ai"),
+        ),
+    ]
     password: Annotated[
         str | None,
         Field(default=None),
@@ -304,6 +320,7 @@ class SingleRedisConfig(BackendAISchema):
             use_tls=self.use_tls,
             tls_skip_verify=self.tls_skip_verify,
             tls_ca_file=self.tls_ca_file,
+            username=self.username,
         )
 
     def to_valkey_target(self) -> ValkeyTarget:
@@ -326,6 +343,7 @@ class SingleRedisConfig(BackendAISchema):
             use_tls=self.use_tls,
             tls_skip_verify=self.tls_skip_verify,
             tls_ca_file=self.tls_ca_file,
+            username=self.username,
         )
 
 
@@ -373,6 +391,7 @@ class RedisConfig(SingleRedisConfig):
             use_tls=self.use_tls,
             tls_skip_verify=self.tls_skip_verify,
             tls_ca_file=self.tls_ca_file,
+            username=self.username,
         )
 
     def to_valkey_profile_target(self) -> ValkeyProfileTarget:
@@ -399,4 +418,5 @@ class RedisConfig(SingleRedisConfig):
             use_tls=self.use_tls,
             tls_skip_verify=self.tls_skip_verify,
             tls_ca_file=self.tls_ca_file,
+            username=self.username,
         )

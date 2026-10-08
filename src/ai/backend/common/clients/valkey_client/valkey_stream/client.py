@@ -414,6 +414,27 @@ class ValkeyStreamClient:
             message = await conn.get_pubsub_message()
         return cast(Mapping[str, str], load_json(message.message))
 
+    @valkey_stream_resilience.apply()
+    async def receive_broadcast_message_with_channel(
+        self,
+    ) -> tuple[str, bytes]:
+        """
+        Receive a broadcast message and the channel it was published on.
+        This method blocks until a message is received.
+        The message is returned undecoded, so that the caller can decide what to do
+        with a message that is not valid JSON.
+
+        :return: A tuple of the channel name and the raw message.
+        """
+        async with self._client.client() as conn:
+            message = await conn.get_pubsub_message()
+        channel = message.channel
+        raw_message = message.message
+        return (
+            channel.decode("utf-8", errors="replace") if isinstance(channel, bytes) else channel,
+            raw_message.encode("utf-8") if isinstance(raw_message, str) else raw_message,
+        )
+
     def _create_batch(self, is_atomic: bool = False) -> Batch:
         """
         Create a batch object for batch operations.

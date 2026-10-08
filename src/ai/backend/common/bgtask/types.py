@@ -9,10 +9,28 @@ from typing import Any, NewType, Protocol, Self
 from pydantic import Field
 from pydantic_core import ValidationError
 
+from ai.backend.common.events.types import EventCacheDomain
 from ai.backend.common.json import dump_json, load_json
 from ai.backend.common.types import BackendAISchema
 
 from .exception import InvalidTaskMetadataError
+
+
+def bgtask_cache_id(task_id: uuid.UUID, cache_scope: str | None = None) -> str:
+    """
+    Return the cache ID under which the broadcast events of a background task are cached.
+
+    Without a scope it is ``bgtask.<task_id>``. With a scope it is
+    ``bgtask.<cache_scope>.<task_id>``, so that each producer can be given its own key space.
+    """
+    if cache_scope is None:
+        return EventCacheDomain.BGTASK.cache_id(str(task_id))
+    return EventCacheDomain.BGTASK.cache_id(f"{cache_scope}.{task_id}")
+
+
+def agent_bgtask_cache_scope(agent_id: str) -> str:
+    """Return the cache scope of the background tasks run by an agent."""
+    return f"agent.{agent_id}"
 
 
 class BgtaskStatus(enum.StrEnum):

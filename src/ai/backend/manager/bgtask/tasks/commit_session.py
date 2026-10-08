@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
-from typing import TYPE_CHECKING, cast, override
+from typing import TYPE_CHECKING, Final, cast, override
 
 from pydantic import Field
 
@@ -11,7 +12,11 @@ from ai.backend.common.bgtask.task.base import (
     BaseBackgroundTaskManifest,
     BaseBackgroundTaskResult,
 )
-from ai.backend.common.bgtask.types import BgtaskStatus
+from ai.backend.common.bgtask.types import (
+    BgtaskStatus,
+    agent_bgtask_cache_scope,
+    bgtask_cache_id,
+)
 from ai.backend.common.data.session.types import CustomizedImageVisibilityScope
 from ai.backend.common.docker import (
     DEFAULT_KERNEL_FEATURE,
@@ -23,8 +28,6 @@ from ai.backend.common.events.event_types.bgtask.broadcast import (
     BaseBgtaskDoneEvent,
     BaseBgtaskEvent,
 )
-from ai.backend.common.events.hub.propagators.cache import WithCachePropagator
-from ai.backend.common.events.types import EventCacheDomain, EventDomain
 from ai.backend.common.exception import BgtaskCancelledError, BgtaskFailedError
 from ai.backend.common.types import AgentId, ImageRegistry, SessionId
 from ai.backend.logging import BraceStyleAdapter
@@ -35,13 +38,18 @@ from ai.backend.manager.errors.kernel import SessionNotFound
 
 if TYPE_CHECKING:
     from ai.backend.common.events.fetcher import EventFetcher
-    from ai.backend.common.events.hub.hub import EventHub
     from ai.backend.manager.models.image import ImageRow
     from ai.backend.manager.registry import AgentRegistry
     from ai.backend.manager.repositories.image.repository import ImageRepository
     from ai.backend.manager.repositories.session.repository import SessionRepository
 
 log = BraceStyleAdapter(logging.getLogger(__spec__.name))
+
+# How long to wait for each agent operation (commit, push) to finish.
+DEFAULT_AGENT_BGTASK_TIMEOUT: Final = 4 * 60 * 60.0
+# How often to read the cached state of an agent operation. It must stay well below
+# the cache expiry (300 seconds) so that the final state is not missed.
+DEFAULT_AGENT_BGTASK_POLL_INTERVAL: Final = 2.0
 
 
 class CommitSessionResult(BaseBackgroundTaskResult):
@@ -81,22 +89,28 @@ class CommitSessionHandler(BaseBackgroundTaskHandler[CommitSessionManifest, Comm
     _session_repository: SessionRepository
     _image_repository: ImageRepository
     _agent_registry: AgentRegistry
-    _event_hub: EventHub
     _event_fetcher: EventFetcher
+    _agent_bgtask_timeout: float
+    _agent_bgtask_poll_interval: float
 
     def __init__(
         self,
         session_repository: SessionRepository,
         image_repository: ImageRepository,
         agent_registry: AgentRegistry,
-        event_hub: EventHub,
         event_fetcher: EventFetcher,
+        *,
+        agent_bgtask_timeout: float = DEFAULT_AGENT_BGTASK_TIMEOUT,
+        agent_bgtask_poll_interval: float = DEFAULT_AGENT_BGTASK_POLL_INTERVAL,
     ) -> None:
+        if agent_bgtask_timeout <= 0 or agent_bgtask_poll_interval <= 0:
+            raise ValueError("The agent task timeout and poll interval must be positive")
         self._session_repository = session_repository
         self._image_repository = image_repository
         self._agent_registry = agent_registry
-        self._event_hub = event_hub
         self._event_fetcher = event_fetcher
+        self._agent_bgtask_timeout = agent_bgtask_timeout
+        self._agent_bgtask_poll_interval = agent_bgtask_poll_interval
 
     @classmethod
     @override
@@ -124,6 +138,13 @@ class CommitSessionHandler(BaseBackgroundTaskHandler[CommitSessionManifest, Comm
                 raise ContainerRegistryNotFound(
                     f"Project {manifest.registry_project} not found in registry {manifest.registry_hostname}"
                 )
+
+            # The agent that commits (and pushes) is the main kernel's agent.
+            if not session.main_kernel.agent:
+                raise BgtaskFailedError(
+                    extra_msg=f"Session {manifest.session_id} main kernel has no agent assigned"
+                )
+            agent_id = AgentId(session.main_kernel.agent)
 
             # Resolve base image
             if not session.main_kernel.image or not session.main_kernel.architecture:
@@ -208,7 +229,7 @@ class CommitSessionHandler(BaseBackgroundTaskHandler[CommitSessionManifest, Comm
             bgtask_id = cast(uuid.UUID, resp["bgtask_id"])
 
             # Wait for commit to complete
-            await self._wait_for_agent_bgtask(bgtask_id, "Commit")
+            await self._wait_for_agent_bgtask(bgtask_id, "Commit", agent_id)
 
             # Push image to registry if not local
             if not new_image_ref.is_local:
@@ -219,17 +240,13 @@ class CommitSessionHandler(BaseBackgroundTaskHandler[CommitSessionManifest, Comm
                     username=registry_conf.username,
                     password=registry_conf.password,
                 )
-                if not session.main_kernel.agent:
-                    raise BgtaskFailedError(
-                        extra_msg=f"Session {manifest.session_id} main kernel has no agent assigned"
-                    )
                 resp = await self._agent_registry.push_image(
-                    AgentId(session.main_kernel.agent),
+                    agent_id,
                     new_image_ref,
                     image_registry,
                 )
                 bgtask_id = cast(uuid.UUID, resp["bgtask_id"])
-                await self._wait_for_agent_bgtask(bgtask_id, "Push")
+                await self._wait_for_agent_bgtask(bgtask_id, "Push", agent_id)
 
             # Rescan updated image
             log.info("Rescanning image")
@@ -258,32 +275,62 @@ class CommitSessionHandler(BaseBackgroundTaskHandler[CommitSessionManifest, Comm
             log.exception("Failed to commit session {}", manifest.session_id)
             raise
 
-    async def _wait_for_agent_bgtask(self, bgtask_id: uuid.UUID, operation_name: str) -> None:
-        """Wait for an agent background task to complete."""
-        propagator = WithCachePropagator(self._event_fetcher)
-        self._event_hub.register_event_propagator(
-            propagator, [(EventDomain.BGTASK, str(bgtask_id))]
-        )
+    async def _wait_for_agent_bgtask(
+        self,
+        bgtask_id: uuid.UUID,
+        operation_name: str,
+        agent_id: AgentId,
+    ) -> None:
+        """
+        Wait for a background task of an agent to finish.
+
+        Only the agent's own cache scope is read, so the outcome comes from the agent that
+        runs the task. The cache is polled instead of relying on live broadcast events, and
+        the wait ends with an error after the timeout.
+        """
+        task_id = uuid.UUID(str(bgtask_id))
+        cache_id = bgtask_cache_id(task_id, agent_bgtask_cache_scope(agent_id))
         try:
-            cache_id = EventCacheDomain.BGTASK.cache_id(str(bgtask_id))
-            async for event in propagator.receive(cache_id):
-                if not isinstance(event, BaseBgtaskEvent):
-                    log.warning("unexpected event: {}", event)
-                    continue
-                match event.status():
-                    case BgtaskStatus.DONE | BgtaskStatus.PARTIAL_SUCCESS:
-                        log.info("{} completed", operation_name)
-                        return
-                    case BgtaskStatus.FAILED:
-                        error_msg = cast(BaseBgtaskDoneEvent, event).message
-                        log.error("{} failed: {}", operation_name, error_msg)
-                        raise BgtaskFailedError(extra_msg=error_msg)
-                    case BgtaskStatus.CANCELLED:
-                        log.warning("{} cancelled", operation_name)
-                        raise BgtaskCancelledError(extra_msg="Operation cancelled")
-                    case BgtaskStatus.UPDATED:
-                        continue
-                    case _:
-                        log.warning("unexpected bgtask done event: {}", event)
-        finally:
-            self._event_hub.unregister_event_propagator(propagator.id())
+            async with asyncio.timeout(self._agent_bgtask_timeout):
+                while True:
+                    event = await self._fetch_agent_bgtask_event(cache_id, task_id)
+                    if event is not None:
+                        match event.status():
+                            case BgtaskStatus.DONE | BgtaskStatus.PARTIAL_SUCCESS:
+                                log.info("{} completed", operation_name)
+                                return
+                            case BgtaskStatus.FAILED:
+                                error_msg = cast(BaseBgtaskDoneEvent, event).message
+                                log.error("{} failed: {}", operation_name, error_msg)
+                                raise BgtaskFailedError(extra_msg=error_msg)
+                            case BgtaskStatus.CANCELLED:
+                                log.warning("{} cancelled", operation_name)
+                                raise BgtaskCancelledError(extra_msg="Operation cancelled")
+                    await asyncio.sleep(self._agent_bgtask_poll_interval)
+        except TimeoutError:
+            log.error(
+                "{} on agent {} did not finish within {} seconds",
+                operation_name,
+                agent_id,
+                self._agent_bgtask_timeout,
+            )
+            raise BgtaskFailedError(
+                extra_msg=(
+                    f"{operation_name} did not finish within {self._agent_bgtask_timeout} seconds"
+                )
+            ) from None
+
+    async def _fetch_agent_bgtask_event(
+        self, cache_id: str, task_id: uuid.UUID
+    ) -> BaseBgtaskEvent | None:
+        try:
+            event = await self._event_fetcher.fetch_cached_event(cache_id)
+        except Exception as e:
+            log.warning("Failed to read the cached state {}: {}", cache_id, e)
+            return None
+        if event is None:
+            return None
+        if not isinstance(event, BaseBgtaskEvent) or event.task_id != task_id:
+            log.warning("unexpected event under {}: {}", cache_id, event)
+            return None
+        return event
