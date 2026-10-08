@@ -22,7 +22,7 @@ from ai.backend.common.resilience import (
     RetryArgs,
     RetryPolicy,
 )
-from ai.backend.common.types import ValkeyTarget
+from ai.backend.common.types import AgentId, ValkeyTarget
 from ai.backend.logging.utils import BraceStyleAdapter
 
 log = BraceStyleAdapter(logging.getLogger(__spec__.name))
@@ -113,6 +113,7 @@ class ValkeyContainerLogClient:
     @valkey_container_log_resilience.apply()
     async def enqueue_container_logs(
         self,
+        agent_id: AgentId,
         container_id: str,
         logs: ContainerLogData,
     ) -> None:
@@ -120,11 +121,12 @@ class ValkeyContainerLogClient:
         Enqueue logs for a specific container.
         TODO: Replace with a more efficient log storage solution.
 
+        :param agent_id: The ID of the agent that hosts the container.
         :param container_id: The ID of the container.
         :param logs: The logs to enqueue.
         :raises: GlideClientError if the logs cannot be enqueued.
         """
-        key = self._container_log_key(container_id)
+        key = self._container_log_key(agent_id, container_id)
         tx = self._create_batch()
         tx.rpush(
             key,
@@ -140,54 +142,77 @@ class ValkeyContainerLogClient:
     @valkey_container_log_resilience.apply()
     async def container_log_len(
         self,
+        agent_id: AgentId,
         container_id: str,
     ) -> int:
         """
         Get the length of logs for a specific container.
 
+        :param agent_id: The ID of the agent that hosts the container.
         :param container_id: The ID of the container.
         :return: The number of logs for the container.
         :raises: GlideClientError if the length cannot be retrieved.
         """
-        key = self._container_log_key(container_id)
+        key = self._container_log_key(agent_id, container_id)
         async with self._client.client() as conn:
             return await conn.llen(key)
 
-    @valkey_container_log_resilience.apply()
     async def pop_container_logs(
         self,
+        agent_id: AgentId,
         container_id: str,
         count: int = 1,
+        *,
+        max_element_size: int | None = None,
     ) -> list[ContainerLogData] | None:
         """
         Pop logs for a specific container.
 
+        Popped elements are parsed after the pop, outside the retried call, so that a
+        malformed element is reported once instead of popping further elements on retry.
+
+        :param agent_id: The ID of the agent that hosts the container.
         :param container_id: The ID of the container.
+        :param max_element_size: If given, reject any element longer than this before parsing it.
         :return: List of logs for the container.
         :raises: GlideClientError if the logs cannot be popped.
+        :raises: ContainerLogError if a popped element is too large or malformed.
         """
-        key = self._container_log_key(container_id)
-        async with self._client.client() as conn:
-            logs = await conn.lpop_count(key, count)
-        if logs is None:
+        raw_logs = await self._pop_raw_container_logs(agent_id, container_id, count)
+        if raw_logs is None:
             return None
+        return [
+            ContainerLogData.deserialize(raw_log, max_size=max_element_size) for raw_log in raw_logs
+        ]
 
-        return [ContainerLogData.deserialize(log) for log in logs]
+    @valkey_container_log_resilience.apply()
+    async def _pop_raw_container_logs(
+        self,
+        agent_id: AgentId,
+        container_id: str,
+        count: int,
+    ) -> list[bytes] | None:
+        key = self._container_log_key(agent_id, container_id)
+        async with self._client.client() as conn:
+            return await conn.lpop_count(key, count)
 
     @valkey_container_log_resilience.apply()
     async def clear_container_logs(
         self,
+        agent_id: AgentId,
         container_id: str,
     ) -> None:
         """
         Clear logs for a specific container.
 
+        :param agent_id: The ID of the agent that hosts the container.
         :param container_id: The ID of the container.
         :raises: GlideClientError if the logs cannot be cleared.
         """
-        key = self._container_log_key(container_id)
+        key = self._container_log_key(agent_id, container_id)
         async with self._client.client() as conn:
             await conn.delete([key])
 
-    def _container_log_key(self, container_id: str) -> str:
-        return f"containerlog.{container_id}"
+    def _container_log_key(self, agent_id: AgentId, container_id: str) -> str:
+        # The agent ID is part of the key so that each agent writes only its own keys.
+        return f"containerlog.{agent_id}.{container_id}"

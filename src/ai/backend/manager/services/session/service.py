@@ -1126,7 +1126,7 @@ class SessionService:
             if kernel_log is not None:
                 # Get logs from database record
                 log.debug("returning log from database record")
-                resp["result"]["logs"] = kernel_log.decode("utf-8")
+                resp["result"]["logs"] = kernel_log.decode("utf-8", errors="replace")
                 return GetContainerLogsActionResult(
                     result=resp, session_data=compute_session.to_dataclass()
                 )

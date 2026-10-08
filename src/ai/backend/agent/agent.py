@@ -1334,6 +1334,7 @@ class AbstractAgent[
                             ContainerLogType.ZLIB, bytes(cb[:chunk_size])
                         )
                         await self.valkey_container_log_client.enqueue_container_logs(
+                            self.id,
                             container_id,
                             chunk_log_item,
                         )
@@ -1354,6 +1355,7 @@ class AbstractAgent[
                     ContainerLogType.ZLIB, chunk_buffer.getvalue()
                 )
                 await self.valkey_container_log_client.enqueue_container_logs(
+                    self.id,
                     container_id,
                     chunk_log_item,
                 )
