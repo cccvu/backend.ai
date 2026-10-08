@@ -57,6 +57,7 @@ class TestLauncherRPCTimeouts:
         per_agent_client_pool: MagicMock,
         sessions_for_pull_multiple: list[SessionDataForPull],
         image_config_default: dict[UUID, ImageConfigData],
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
         per_agent_client_pool.client(AgentId("agent-1")).check_and_pull.side_effect = _hang
         per_agent_client_pool.client(AgentId("agent-2")).check_and_pull.return_value = {}
@@ -67,8 +68,10 @@ class TestLauncherRPCTimeouts:
             await launcher.trigger_image_pulling(sessions_for_pull_multiple, image_config_default)
         elapsed = time.monotonic() - started
 
+        per_agent_client_pool.client(AgentId("agent-1")).check_and_pull.assert_awaited_once()
         per_agent_client_pool.client(AgentId("agent-2")).check_and_pull.assert_awaited_once()
         assert elapsed < BOUNDED
+        assert "Failed to trigger image pulling on agent agent-1: TimeoutError()" in caplog.text
 
     async def test_create_kernels_hang_is_bounded_and_recorded_as_failed_agent(
         self,
@@ -77,6 +80,7 @@ class TestLauncherRPCTimeouts:
         mock_valkey_schedule: AsyncMock,
         session_for_start_multi_node: SessionDataForStart,
         image_config_default: dict[UUID, ImageConfigData],
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
         per_agent_client_pool.client(AgentId("agent-1")).create_kernels.side_effect = _hang
         per_agent_client_pool.client(AgentId("agent-2")).create_kernels.return_value = None
@@ -89,11 +93,13 @@ class TestLauncherRPCTimeouts:
             )
         elapsed = time.monotonic() - started
 
+        per_agent_client_pool.client(AgentId("agent-1")).create_kernels.assert_awaited_once()
         per_agent_client_pool.client(AgentId("agent-2")).create_kernels.assert_awaited_once()
         mock_valkey_schedule.record_session_failed_agents.assert_awaited_once_with(
             session_for_start_multi_node.session_id, [AgentId("agent-1")]
         )
         assert elapsed < BOUNDED
+        assert "recording failed agents: {'agent-1': 'TimeoutError()'}" in caplog.text
 
     async def test_assign_port_hang_is_bounded_and_records_error(
         self,
@@ -114,8 +120,10 @@ class TestLauncherRPCTimeouts:
             )
         elapsed = time.monotonic() - started
 
+        agent_client.assign_port.assert_awaited_once()
         agent_client.create_kernels.assert_not_awaited()
         mock_repository.update_session_error_info.assert_awaited_once()
+        assert "TimeoutError" in str(mock_repository.update_session_error_info.await_args)
         assert elapsed < BOUNDED
 
     async def test_create_local_network_hang_is_bounded_and_records_error(
@@ -137,6 +145,8 @@ class TestLauncherRPCTimeouts:
             )
         elapsed = time.monotonic() - started
 
+        agent_client.create_local_network.assert_awaited_once()
         agent_client.create_kernels.assert_not_awaited()
         mock_repository.update_session_error_info.assert_awaited_once()
+        assert "TimeoutError" in str(mock_repository.update_session_error_info.await_args)
         assert elapsed < BOUNDED

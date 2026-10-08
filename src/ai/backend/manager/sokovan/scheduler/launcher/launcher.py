@@ -151,8 +151,10 @@ class SessionLauncher:
                 async with self._agent_client_pool.acquire(agent_id) as client:
                     return await client.check_and_pull(images)
 
+        pull_agent_ids: list[AgentId] = []
         pull_tasks: list[Awaitable[Mapping[str, str]]] = []
         for agent_id, agent_images in agent_image_configs.items():
+            pull_agent_ids.append(agent_id)
             pull_tasks.append(pull_for_agent(agent_id, agent_images))
 
         if pull_tasks:
@@ -164,7 +166,14 @@ class SessionLauncher:
                     "check_and_pull_images",
                     success_detail="Image pull triggered",
                 ):
-                    await asyncio.gather(*pull_tasks, return_exceptions=True)
+                    pull_results = await asyncio.gather(*pull_tasks, return_exceptions=True)
+            for agent_id, pull_result in zip(pull_agent_ids, pull_results, strict=True):
+                if isinstance(pull_result, BaseException):
+                    log.warning(
+                        "Failed to trigger image pulling on agent {}: {!r}",
+                        agent_id,
+                        pull_result,
+                    )
 
     async def start_sessions_for_handler(
         self,
@@ -428,16 +437,17 @@ class SessionLauncher:
 
             if create_tasks:
                 results = await asyncio.gather(*create_tasks, return_exceptions=True)
-                failed_agent_ids = [
-                    aid
+                failures = {
+                    aid: result
                     for aid, result in zip(agent_ids_ordered, results, strict=True)
                     if isinstance(result, BaseException)
-                ]
+                }
+                failed_agent_ids = list(failures)
                 if failed_agent_ids:
                     log.warning(
                         log_fmt + "recording failed agents: {}",
                         *log_args,
-                        failed_agent_ids,
+                        {aid: repr(exc) for aid, exc in failures.items()},
                     )
                     try:
                         await self._valkey_schedule.record_session_failed_agents(
