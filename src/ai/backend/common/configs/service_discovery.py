@@ -84,6 +84,20 @@ class ServiceDiscoveryConfig(BaseConfigSchema):
     with each other in a distributed environment.
     """
 
+    enabled: Annotated[
+        bool,
+        Field(default=True),
+        BackendAIConfigMeta(
+            description=(
+                "Whether this service registers itself in service discovery. "
+                "Only the agent honors this flag for now: when false, the agent neither "
+                "registers itself nor publishes service discovery events. "
+                "The manager still tracks the agent through its heartbeats."
+            ),
+            added_version="26.8.4",
+            example=ConfigExample(local="true", prod="true"),
+        ),
+    ]
     type: Annotated[
         ServiceDiscoveryType,
         Field(default=ServiceDiscoveryType.REDIS),
