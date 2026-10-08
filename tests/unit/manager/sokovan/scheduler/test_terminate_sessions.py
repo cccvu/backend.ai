@@ -27,7 +27,6 @@ from ai.backend.manager.clients.agent import AgentClientPool
 from ai.backend.manager.data.kernel.types import KernelStatus
 from ai.backend.manager.data.session.types import SessionStatus
 from ai.backend.manager.sokovan.recorder.context import RecorderContext
-from ai.backend.manager.sokovan.scheduler.results import ScheduleResult
 from ai.backend.manager.sokovan.scheduler.terminator.terminator import (
     SessionTerminator,
     SessionTerminatorArgs,
@@ -110,8 +109,7 @@ class TestTerminateSessions:
             result = await terminator._terminate_sessions_internal(terminating_sessions)
 
         # Verify
-        assert isinstance(result, ScheduleResult)
-        assert len(result.scheduled_session_ids) == 0
+        assert result == []
 
     async def test_terminate_sessions_single_success(
         self,
@@ -155,9 +153,8 @@ class TestTerminateSessions:
             result = await terminator._terminate_sessions_internal([terminating_session])
 
         # Verify
-        # Returns empty result (status updates handled by events/sweep)
-        assert isinstance(result, ScheduleResult)
-        assert len(result.scheduled_session_ids) == 0
+        # The session's only kernel was destroyed (status updates handled by events/sweep)
+        assert result == [session_id]
 
         # Verify agent destroy_kernel was called with correct parameters
         # Note: AgentClient.destroy_kernel accepts SessionId type and converts to str internally
@@ -205,9 +202,8 @@ class TestTerminateSessions:
             result = await terminator._terminate_sessions_internal([terminating_session])
 
         # Verify
-        # Returns empty result (status updates handled by events/sweep)
-        assert isinstance(result, ScheduleResult)
-        assert len(result.scheduled_session_ids) == 0
+        # All kernels were destroyed (status updates handled by events/sweep)
+        assert result == [session_id]
 
         # Verify all kernels had RPC calls made
         # Note: AgentClient.destroy_kernel accepts SessionId type and converts to str internally
@@ -273,8 +269,8 @@ class TestTerminateSessions:
             result = await terminator._terminate_sessions_internal([terminating_session])
 
         # Verify
-        # Session should not be counted as terminated due to partial failure
-        assert len(result.scheduled_session_ids) == 0
+        # Session should not be counted as succeeded due to partial failure
+        assert result == []
 
     async def test_terminate_sessions_concurrent_execution(
         self,
@@ -341,9 +337,8 @@ class TestTerminateSessions:
         elapsed = time.time() - start_time
 
         # Verify
-        # Returns empty result (status updates handled by events/sweep)
-        assert isinstance(result, ScheduleResult)
-        assert len(result.scheduled_session_ids) == 0
+        # Every session's kernels were destroyed (status updates handled by events/sweep)
+        assert result == session_ids
 
         # Verify all RPC calls were made
         for i, agent_id in enumerate(all_agent_ids):
@@ -378,5 +373,5 @@ class TestTerminateSessions:
             result = await terminator._terminate_sessions_internal([terminating_session])
 
         # Verify
-        # Session without kernels cannot be terminated
-        assert len(result.scheduled_session_ids) == 0
+        # A session without kernels has nothing to destroy, so it counts as succeeded
+        assert result == [session_id]

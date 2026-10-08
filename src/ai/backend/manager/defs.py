@@ -123,6 +123,26 @@ DEFAULT_PROJECT_NAME: Final = "default"
 DEFAULT_SHARED_MEMORY_SIZE: Final[str] = "64m"
 START_SESSION_TIMEOUT_SEC: Final[float] = 60 * 30  # 30 min
 
+# Upper bounds for agent RPCs awaited by the sokovan scheduler.
+# The scheduler holds a global lock while it awaits these calls, so an agent that accepts
+# a call and never replies must not stall scheduling for every other agent.
+# On timeout the agent keeps working on the request; its events drive the state.
+
+# The agent-side lookup is in memory.
+AGENT_CHECK_RUNNING_TIMEOUT_SEC: Final[float] = 10
+# The agent keeps destroying after the manager stops waiting; the next tick re-sends.
+AGENT_DESTROY_KERNEL_TIMEOUT_SEC: Final[float] = 60
+# The agent spawns background pulls and returns.
+AGENT_CHECK_AND_PULL_TIMEOUT_SEC: Final[float] = 30
+# Covers legitimate container creation (including kernel init) within START_SESSION_TIMEOUT_SEC.
+AGENT_CREATE_KERNELS_TIMEOUT_SEC: Final[float] = 60 * 10  # 10 min
+# create_local_network / destroy_local_network make one container-runtime network call.
+AGENT_NETWORK_RPC_TIMEOUT_SEC: Final[float] = 60
+# The agent takes a port from its in-memory pool.
+AGENT_ASSIGN_PORT_TIMEOUT_SEC: Final[float] = 10
+# The agent schedules the batch task and returns.
+AGENT_TRIGGER_BATCH_TIMEOUT_SEC: Final[float] = 60
+
 
 DEFAULT_METRIC_RANGE_VECTOR_TIMEWINDOW: Final[str] = "5m"
 

@@ -6,6 +6,7 @@ and internally dispatch to session-type specific logic.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -20,6 +21,10 @@ from ai.backend.common.types import (
 from ai.backend.logging import BraceStyleAdapter
 from ai.backend.manager.clients.agent.pool import AgentClientPool
 from ai.backend.manager.config.provider import ManagerConfigProvider
+from ai.backend.manager.defs import (
+    AGENT_NETWORK_RPC_TIMEOUT_SEC,
+    AGENT_TRIGGER_BATCH_TIMEOUT_SEC,
+)
 from ai.backend.manager.errors.common import ServerMisconfiguredError
 from ai.backend.manager.errors.resource import AgentNotAllocated
 from ai.backend.manager.models.network import NetworkType
@@ -112,14 +117,17 @@ class RunningTransitionHook(StatusTransitionHook):
                 "trigger_batch_execution",
                 success_detail=f"Triggered batch execution on agent {agent_id}",
             ):
-                async with self._deps.agent_client_pool.acquire(agent_id) as client:
-                    session_batch_timeout = session.session_info.lifecycle.batch_timeout
-                    await client.trigger_batch_execution(
-                        session_id,
-                        main_kernel.id,
-                        main_kernel.runtime.startup_command or "",
-                        float(session_batch_timeout) if session_batch_timeout is not None else None,
-                    )
+                async with asyncio.timeout(AGENT_TRIGGER_BATCH_TIMEOUT_SEC):
+                    async with self._deps.agent_client_pool.acquire(agent_id) as client:
+                        session_batch_timeout = session.session_info.lifecycle.batch_timeout
+                        await client.trigger_batch_execution(
+                            session_id,
+                            main_kernel.id,
+                            main_kernel.runtime.startup_command or "",
+                            float(session_batch_timeout)
+                            if session_batch_timeout is not None
+                            else None,
+                        )
         log.info(
             "Successfully triggered batch execution for session {} on agent {}",
             session_id,
@@ -184,18 +192,19 @@ class TerminatedTransitionHook(StatusTransitionHook):
         agent_id = session.main_kernel.resource.agent
         if agent_id is None:
             raise AgentNotAllocated(f"Main kernel has no agent assigned for session {session_id}")
-        async with self._deps.agent_client_pool.acquire(AgentId(agent_id)) as client:
-            try:
-                await client.destroy_local_network(network_id)
-            except Exception:
-                log.exception(
-                    "Failed to destroy local network on agent for session. "
-                    "Session ID: {}, Network ID: {}, Agent ID: {}",
-                    session_id,
-                    network_id,
-                    agent_id,
-                )
-                raise
+        async with asyncio.timeout(AGENT_NETWORK_RPC_TIMEOUT_SEC):
+            async with self._deps.agent_client_pool.acquire(AgentId(agent_id)) as client:
+                try:
+                    await client.destroy_local_network(network_id)
+                except Exception:
+                    log.exception(
+                        "Failed to destroy local network on agent for session. "
+                        "Session ID: {}, Network ID: {}, Agent ID: {}",
+                        session_id,
+                        network_id,
+                        agent_id,
+                    )
+                    raise
 
     async def _destroy_overlay_network(self, session_id: SessionId, network_id: str) -> None:
         default_driver = self._deps.config_provider.config.network.inter_container.default_driver
