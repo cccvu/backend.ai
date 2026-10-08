@@ -85,6 +85,7 @@ class TestBatchExecutionTrigger:
         recorder = _BatchRecorder()
         agent = _make_agent(recorder)
         session_id, kernel_id = SessionId(uuid4()), KernelId(uuid4())
+        agent.kernel_registry[kernel_id] = _kernel_obj()
 
         await _trigger(agent, session_id, kernel_id)
         await _trigger(agent, session_id, kernel_id)
@@ -96,6 +97,7 @@ class TestBatchExecutionTrigger:
         recorder = _BatchRecorder()
         agent = _make_agent(recorder)
         session_id, kernel_id = SessionId(uuid4()), KernelId(uuid4())
+        agent.kernel_registry[kernel_id] = _kernel_obj()
 
         await asyncio.gather(
             _trigger(agent, session_id, kernel_id),
@@ -110,6 +112,8 @@ class TestBatchExecutionTrigger:
         agent = _make_agent(recorder)
         session_id = SessionId(uuid4())
         kernel_a, kernel_b = KernelId(uuid4()), KernelId(uuid4())
+        agent.kernel_registry[kernel_a] = _kernel_obj()
+        agent.kernel_registry[kernel_b] = _kernel_obj()
 
         await _trigger(agent, session_id, kernel_a)
         await _trigger(agent, session_id, kernel_b)
@@ -122,12 +126,14 @@ class TestBatchExecutionTrigger:
         session_id, kernel_id = SessionId(uuid4()), KernelId(uuid4())
         first_recorder = _BatchRecorder()
         first_agent = _make_agent(first_recorder)
+        first_agent.kernel_registry[kernel_id] = _kernel_obj()
         await _trigger(first_agent, session_id, kernel_id)
         await _settle(first_agent, first_recorder)
 
         # A fresh process starts with an empty marker set.
         second_recorder = _BatchRecorder()
         second_agent = _make_agent(second_recorder)
+        second_agent.kernel_registry[kernel_id] = _kernel_obj()
         await _trigger(second_agent, session_id, kernel_id)
         await _settle(second_agent, second_recorder)
 
@@ -139,12 +145,29 @@ class TestBatchExecutionTrigger:
         recorder = _BatchRecorder()
         agent = _make_agent(recorder)
         session_id, kernel_id = SessionId(uuid4()), KernelId(uuid4())
+        agent.kernel_registry[kernel_id] = _kernel_obj()
 
         await _trigger(agent, session_id, kernel_id)
         await _settle(agent, recorder)
         await _trigger(agent, session_id, kernel_id)
         await _settle(agent, recorder)
 
+        assert recorder.calls == [kernel_id]
+
+    async def test_unknown_kernel_leaves_no_marker(self) -> None:
+        """A trigger for a kernel the agent does not have neither runs nor blocks a later one."""
+        recorder = _BatchRecorder()
+        agent = _make_agent(recorder)
+        session_id, kernel_id = SessionId(uuid4()), KernelId(uuid4())
+
+        await _trigger(agent, session_id, kernel_id)
+        await _settle(agent, recorder)
+        assert recorder.calls == []
+        assert kernel_id not in agent._batch_started_kernels
+
+        agent.kernel_registry[kernel_id] = _kernel_obj()
+        await _trigger(agent, session_id, kernel_id)
+        await _settle(agent, recorder)
         assert recorder.calls == [kernel_id]
 
 
@@ -169,6 +192,8 @@ class TestBatchExecutionMarkerCleanup:
 
         assert kernel_id not in agent.kernel_registry
         assert kernel_id not in agent._batch_started_kernels
+        # A new container registered under the same kernel id may be triggered again.
+        agent.kernel_registry[kernel_id] = _kernel_obj()
         await _trigger(agent, session_id, kernel_id)
         await _settle(agent, recorder)
         assert recorder.calls == [kernel_id, kernel_id]
@@ -212,6 +237,8 @@ class TestBatchExecutionMarkerCleanup:
 
         assert kernel_id not in agent.kernel_registry
         assert kernel_id not in agent._batch_started_kernels
+        # A new container registered under the same kernel id may be triggered again.
+        agent.kernel_registry[kernel_id] = _kernel_obj()
         await _trigger(agent, session_id, kernel_id)
         await _settle(agent, recorder)
         assert recorder.calls == [kernel_id, kernel_id]

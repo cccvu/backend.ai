@@ -2508,6 +2508,10 @@ class AbstractAgent[
         # The marker is kept in memory only and set in the same synchronous step as the
         # task spawn: if the agent dies, the marker dies with it and a later retry starts
         # the batch job again, instead of a persisted marker skipping it forever.
+        if kernel_id not in self.kernel_registry:
+            # Nothing to run, and no marker to leave behind: only CLEAN clears it.
+            log.warning("create_batch_execution_task(k:{}): no such kernel", kernel_id)
+            return
         if kernel_id in self._batch_started_kernels:
             log.info(
                 "create_batch_execution_task(k:{}): batch execution already started, "
