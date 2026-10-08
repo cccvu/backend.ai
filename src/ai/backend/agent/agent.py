@@ -1096,13 +1096,12 @@ class AbstractAgent[
         Returns the message queue object.
         """
         node_id = self.id
+        agent_config = self.local_config.agent
         args = RedisMQArgs(
-            anycast_stream_key="events",
-            broadcast_channel="events_all",
+            anycast_stream_key=agent_config.event_stream_key,
+            broadcast_channel=agent_config.event_channel,
             consume_stream_keys=None,
-            subscribe_channels={
-                "events_all",
-            },
+            subscribe_channels=set(agent_config.event_subscribe_channels),
             group_name=EVENT_DISPATCHER_CONSUMER_GROUP,
             node_id=node_id,
             db=REDIS_STREAM_DB,

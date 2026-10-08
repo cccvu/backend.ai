@@ -1,9 +1,16 @@
 from uuid import UUID
 
+import pytest
+
 from ai.backend.common.contexts.user import current_user, triggered_user
 from ai.backend.common.data.user.types import UserData, UserRole
 from ai.backend.common.json import dump_json, load_json
-from ai.backend.common.message_queue.types import MessageMetadata
+from ai.backend.common.message_queue.types import (
+    BroadcastMessage,
+    MessageMetadata,
+    MQMessage,
+    resolve_ack_stream_key,
+)
 
 
 def _make_user(user_id: str, is_superadmin: bool = False) -> UserData:
@@ -221,3 +228,57 @@ class TestMessageMetadata:
         # Reset after the block — also covers the system-event case (both None).
         assert current_user() is None
         assert triggered_user() is None
+
+
+class TestMQMessageRetry:
+    @pytest.mark.parametrize("count", [0, 1, 2, 3])
+    def test_retry_increments_count_within_limit(self, count: int) -> None:
+        msg = MQMessage(b"1-0", {b"_retry_count": str(count).encode()})
+        assert msg.retry() is True
+        assert msg.payload[b"_retry_count"] == str(count + 1).encode()
+
+    def test_retry_without_count_starts_at_one(self) -> None:
+        msg = MQMessage(b"1-0", {b"name": b"x"})
+        assert msg.retry() is True
+        assert msg.payload[b"_retry_count"] == b"1"
+
+    def test_retry_refused_past_limit(self) -> None:
+        msg = MQMessage(b"1-0", {b"_retry_count": b"4"})
+        assert msg.retry() is False
+        assert msg.payload[b"_retry_count"] == b"4"
+
+    @pytest.mark.parametrize(
+        "value",
+        [b"x", b"-1", b"", b"\xff", b"1.5", b"9" * 5000, b"99999999999999999999"],
+    )
+    def test_malformed_count_discards_without_raising(self, value: bytes) -> None:
+        msg = MQMessage(b"1-0", {b"_retry_count": value})
+        assert msg.retry() is False
+        assert msg.payload[b"_retry_count"] == value
+
+
+class TestMessageOrigin:
+    def test_stream_key_and_channel_default_to_none(self) -> None:
+        assert MQMessage(b"1-0", {}).stream_key is None
+        assert BroadcastMessage({}).channel is None
+
+    def test_stream_key_and_channel_are_kept(self) -> None:
+        assert MQMessage(b"1-0", {}, stream_key="events:a").stream_key == "events:a"
+        assert BroadcastMessage({}, channel="events_all:a").channel == "events_all:a"
+
+
+class TestResolveAckStreamKey:
+    def test_given_stream_key_is_used(self) -> None:
+        assert resolve_ack_stream_key("b", {"a", "b"}) == "b"
+
+    def test_single_stream_is_used_without_stream_key(self) -> None:
+        assert resolve_ack_stream_key(None, {"events"}) == "events"
+
+    @pytest.mark.parametrize("consumed", [set(), {"a", "b"}])
+    def test_missing_stream_key_is_refused_unless_one_stream(self, consumed: set[str]) -> None:
+        with pytest.raises(ValueError):
+            resolve_ack_stream_key(None, consumed)
+
+    def test_stream_not_consumed_is_refused(self) -> None:
+        with pytest.raises(ValueError):
+            resolve_ack_stream_key("c", {"a", "b"})

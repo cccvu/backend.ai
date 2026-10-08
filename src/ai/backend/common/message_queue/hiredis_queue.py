@@ -15,7 +15,13 @@ from ai.backend.common.types import RedisTarget
 from ai.backend.logging.utils import BraceStyleAdapter
 
 from .queue import AbstractMessageQueue
-from .types import BroadcastMessage, BroadcastPayload, MessageId, MQMessage
+from .types import (
+    BroadcastMessage,
+    BroadcastPayload,
+    MessageId,
+    MQMessage,
+    resolve_ack_stream_key,
+)
 
 log = BraceStyleAdapter(logging.getLogger(__spec__.name))
 
@@ -190,8 +196,9 @@ class HiRedisQueue(AbstractMessageQueue):
                 break
 
     @override
-    async def done(self, msg_id: MessageId) -> None:
-        await self._done(self._anycast_stream_key, msg_id)
+    async def done(self, msg_id: MessageId, *, stream_key: str | None = None) -> None:
+        ack_stream_key = resolve_ack_stream_key(stream_key, self._consume_stream_keys or set())
+        await self._done(ack_stream_key, msg_id)
 
     async def _done(self, stream_key: str, msg_id: MessageId) -> None:
         async with RedisConnection(self._target, db=self._db) as client:
@@ -223,7 +230,7 @@ class HiRedisQueue(AbstractMessageQueue):
                     autoclaim_start_id = next_start_id
                     continue
             except hiredis.HiredisError as e:
-                await self._failover_consumer(e)
+                await self._failover_consumer(e, stream_key)
             except Exception as e:
                 log.error("Error while auto claiming messages: {}", e)
             await asyncio.sleep(_DEFAULT_AUTOCLAIM_INTERVAL / 1000)
@@ -254,7 +261,7 @@ class HiRedisQueue(AbstractMessageQueue):
                         key = messages[i]
                         value = messages[i + 1]
                         payload[key] = value
-                    msg = MQMessage(msg_id, payload)
+                    msg = MQMessage(msg_id, payload, stream_key=stream_key)
                     if msg.retry():
                         await self._retry_message(stream_key, msg)
                     else:
@@ -288,7 +295,7 @@ class HiRedisQueue(AbstractMessageQueue):
             try:
                 await self._read_messages(stream_key)
             except hiredis.HiredisError as e:
-                await self._failover_consumer(e)
+                await self._failover_consumer(e, stream_key)
             except Exception as e:
                 log.exception("Error while reading messages: {}", e)
 
@@ -321,7 +328,7 @@ class HiRedisQueue(AbstractMessageQueue):
                         key = messages[i]
                         value = messages[i + 1]
                         payload[key] = value
-                    msg = MQMessage(msg_id, payload)
+                    msg = MQMessage(msg_id, payload, stream_key=stream_key)
                     await self._consume_queue.put(msg)
 
     async def _read_broadcast_messages_loop(self, subscribe_channels: set[str]) -> None:
@@ -330,7 +337,7 @@ class HiRedisQueue(AbstractMessageQueue):
             try:
                 await self._read_broadcast_messages(subscribe_channels)
             except hiredis.HiredisError as e:
-                await self._failover_consumer(e)
+                await self._failover_consumer(e, self._anycast_stream_key)
             except Exception as e:
                 log.error("Error while reading broadcast messages: {}", e)
                 await asyncio.sleep(_DEFAULT_AUTO_RECONNECT_INTERVAL)
@@ -345,14 +352,23 @@ class HiRedisQueue(AbstractMessageQueue):
                     log.debug("Invalid reply from subscribe: {}", reply)
                     continue
                 _, channel, payload_bytes = reply
-                payload = load_json(payload_bytes)
+                try:
+                    payload = load_json(payload_bytes)
+                except (TypeError, ValueError):
+                    payload = None
+                if not isinstance(payload, dict):
+                    log.debug("Dropped an undecodable broadcast message on {!r}", channel)
+                    continue
                 await self._subscribe_queue.put(
                     BroadcastMessage(
                         payload=payload,
+                        channel=channel.decode("utf-8", errors="replace")
+                        if isinstance(channel, bytes)
+                        else channel,
                     )
                 )
 
-    async def _failover_consumer(self, e: hiredis.HiredisError) -> None:
+    async def _failover_consumer(self, e: hiredis.HiredisError, stream_key: str) -> None:
         # If the group does not exist, create it
         # and start the auto claim loop again
         if not e.args[0].startswith("NOGROUP "):
@@ -363,7 +379,7 @@ class HiRedisQueue(AbstractMessageQueue):
                 await client.execute([
                     "XGROUP",
                     "CREATE",
-                    self._anycast_stream_key,
+                    stream_key,
                     self._group_name,
                     "$",
                     "MKSTREAM",

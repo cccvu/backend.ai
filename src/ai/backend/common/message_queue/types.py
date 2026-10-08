@@ -1,5 +1,5 @@
 import base64
-from collections.abc import Iterator, Mapping
+from collections.abc import Collection, Iterator, Mapping
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from typing import Self, cast
@@ -28,31 +28,70 @@ class BroadcastPayload:
 @dataclass
 class BroadcastMessage:
     payload: Mapping[str, str]
+    # The channel the message was received on, if known.
+    channel: str | None = None
 
 
 @dataclass
 class MQMessage:
     msg_id: MessageId
     payload: dict[bytes, bytes]
+    # The stream the message was read from, if known.
+    # Pass it to `done()` so that the message is acknowledged on the same stream.
+    stream_key: str | None = None
 
     def retry(self) -> bool:
         """
         Retry the message.
         If the message has been retried more than the maximum number of retries,
+        or its retry count is not a valid non-negative integer,
         the message will be discarded.
         The retry count is stored in the message payload.
         """
-        if self._retry_count() > _DEFAULT_MAX_RETRIES:
+        count = self._retry_count()
+        if count is None or count > _DEFAULT_MAX_RETRIES:
             return False
-        self.payload[_DEFAULT_RETRY_FIELD] = str(self._retry_count() + 1).encode("utf-8")
+        self.payload[_DEFAULT_RETRY_FIELD] = str(count + 1).encode("utf-8")
         return True
 
-    def _retry_count(self) -> int:
+    def _retry_count(self) -> int | None:
         """
         Get the retry count of the message.
         The retry count is the number of times the message has been re-delivered.
+        Returns None if the stored value is not a non-negative integer.
         """
-        return int(self.payload.get(_DEFAULT_RETRY_FIELD, b"0"))
+        try:
+            count = int(self.payload.get(_DEFAULT_RETRY_FIELD, b"0"))
+        except (TypeError, ValueError):
+            # ValueError also covers values longer than the int conversion limit.
+            return None
+        if count < 0:
+            return None
+        return count
+
+
+def resolve_ack_stream_key(stream_key: str | None, consumed_stream_keys: Collection[str]) -> str:
+    """
+    Return the stream on which a message should be acknowledged.
+
+    If `stream_key` is None, the consumer must consume exactly one stream, which is used.
+    A message read from one of several streams must be acknowledged with its `stream_key`,
+    because acknowledging it on another stream would leave it pending.
+
+    Raises:
+        ValueError: If the stream cannot be determined or is not consumed.
+    """
+    if stream_key is None:
+        if len(consumed_stream_keys) != 1:
+            raise ValueError(
+                f"A stream key is required to acknowledge a message "
+                f"when consuming {len(consumed_stream_keys)} streams"
+            )
+        (stream_key,) = consumed_stream_keys
+        return stream_key
+    if stream_key not in consumed_stream_keys:
+        raise ValueError(f"Stream {stream_key!r} is not consumed here")
+    return stream_key
 
 
 @dataclass

@@ -52,14 +52,18 @@ class MessageQueueDependency(
         redis_profile_target = config.redis.to_redis_profile_target()
         stream_redis_target = redis_profile_target.profile_target(RedisRole.STREAM)
         node_id = config.manager.id
+        # The manager always consumes its own stream and channel;
+        # the extra ones carry events from producers that use their own.
         args = RedisMQArgs(
             anycast_stream_key="events",
             broadcast_channel="events_all",
             consume_stream_keys={
                 "events",
+                *config.manager.extra_event_stream_keys,
             },
             subscribe_channels={
                 "events_all",
+                *config.manager.extra_event_channels,
             },
             group_name=EVENT_DISPATCHER_CONSUMER_GROUP,
             node_id=node_id,

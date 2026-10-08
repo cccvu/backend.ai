@@ -238,8 +238,8 @@ async def check_and_upgrade(
     redis_mq = await RedisQueue.create(
         redis_profile_target.profile_target(RedisRole.STREAM),
         RedisMQArgs(
-            anycast_stream_key="events",
-            broadcast_channel="events_all",
+            anycast_stream_key=local_config.storage_proxy.event_stream_key,
+            broadcast_channel=local_config.storage_proxy.event_channel,
             consume_stream_keys=None,
             subscribe_channels=None,
             group_name=EVENT_DISPATCHER_CONSUMER_GROUP,

@@ -254,12 +254,10 @@ async def _make_message_queue(
     stream_redis_target = redis_profile_target.profile_target(RedisRole.STREAM)
     node_id = local_config.storage_proxy.node_id
     args = RedisMQArgs(
-        anycast_stream_key="events",
-        broadcast_channel="events_all",
+        anycast_stream_key=local_config.storage_proxy.event_stream_key,
+        broadcast_channel=local_config.storage_proxy.event_channel,
         consume_stream_keys=None,
-        subscribe_channels={
-            "events_all",
-        },
+        subscribe_channels=set(local_config.storage_proxy.event_subscribe_channels),
         group_name=EVENT_DISPATCHER_CONSUMER_GROUP,
         node_id=node_id,
         db=REDIS_STREAM_DB,

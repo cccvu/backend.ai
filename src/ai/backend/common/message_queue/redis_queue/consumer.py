@@ -16,7 +16,11 @@ from aiotools.server import process_index
 from ai.backend.common.clients.valkey_client.valkey_stream.client import ValkeyStreamClient
 from ai.backend.common.defs import REDIS_STREAM_DB
 from ai.backend.common.message_queue.abc import AbstractConsumer
-from ai.backend.common.message_queue.types import MessageId, MQMessage
+from ai.backend.common.message_queue.types import (
+    MessageId,
+    MQMessage,
+    resolve_ack_stream_key,
+)
 from ai.backend.common.types import RedisTarget
 from ai.backend.logging.utils import BraceStyleAdapter
 
@@ -187,27 +191,29 @@ class RedisConsumer(AbstractConsumer):
                 break
 
     @override
-    async def done(self, msg_id: MessageId) -> None:
+    async def done(self, msg_id: MessageId, *, stream_key: str | None = None) -> None:
         """
         Acknowledge that a message has been processed successfully.
 
         Args:
             msg_id: The message identifier to acknowledge
+            stream_key: The stream the message was read from (`MQMessage.stream_key`).
+                It may be omitted only when exactly one stream is consumed.
 
         Raises:
             MessageQueueClosedError: If the consumer is closed
+            ValueError: If the stream cannot be determined or is not consumed
         """
         if self._closed:
             raise MessageQueueClosedError("Consumer is closed")
 
-        # Note: We acknowledge on the first stream key as the message could be from any stream
-        # In practice, msg_id should be unique across streams so this should work
-        for stream_key in self._stream_keys:
-            try:
-                await self._client.done_stream_message(stream_key, self._group_name, msg_id)
-                break
-            except Exception:
-                continue  # Try next stream if this one fails
+        ack_stream_key = resolve_ack_stream_key(stream_key, self._stream_keys)
+        try:
+            await self._client.done_stream_message(ack_stream_key, self._group_name, msg_id)
+        except Exception as e:
+            log.warning(
+                "Failed to acknowledge message {!r} on stream {}: {}", msg_id, ack_stream_key, e
+            )
 
     @override
     async def close(self) -> None:
@@ -290,7 +296,7 @@ class RedisConsumer(AbstractConsumer):
             return
 
         for msg in payload:
-            mq_msg = MQMessage(msg_id=msg.msg_id, payload={**msg.payload})
+            mq_msg = MQMessage(msg_id=msg.msg_id, payload={**msg.payload}, stream_key=stream_key)
             await self._consume_queue.put(mq_msg)
 
     async def _auto_claim_loop(
@@ -362,7 +368,7 @@ class RedisConsumer(AbstractConsumer):
             return autoclaim_start_id, False
 
         for msg in message.messages:
-            mq_msg = MQMessage(msg.msg_id, {**msg.payload})
+            mq_msg = MQMessage(msg.msg_id, {**msg.payload}, stream_key=stream_key)
             if mq_msg.retry():
                 await self._retry_message(stream_key, mq_msg)
                 continue
