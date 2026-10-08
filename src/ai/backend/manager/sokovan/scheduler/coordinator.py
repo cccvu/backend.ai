@@ -1037,7 +1037,7 @@ class ScheduleCoordinator:
 
             if isinstance(hook_result, BaseException):
                 log.error(
-                    "Hook failed for session {} transitioning to {}: {}",
+                    "Hook failed for session {} transitioning to {}: {!r}",
                     session_id,
                     target_status,
                     hook_result,
