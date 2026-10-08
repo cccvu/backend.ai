@@ -2026,6 +2026,7 @@ class ValkeyTarget:
     use_tls: bool = False
     tls_skip_verify: bool = False
     tls_ca_file: str | None = None
+    username: str | None = None
 
     def __getitem__(self, key: str) -> Any:
         return getattr(self, key)
@@ -2051,6 +2052,7 @@ class RedisTarget:
     use_tls: bool = False
     tls_skip_verify: bool = False
     tls_ca_file: str | None = None
+    username: str | None = None
 
     def __getitem__(self, key: str) -> Any:
         return getattr(self, key)
@@ -2065,17 +2067,7 @@ class RedisTarget:
         return getattr(self, key, default)
 
     def copy(self) -> RedisTarget:
-        return RedisTarget(
-            addr=self.addr,
-            sentinel=self.sentinel,
-            service_name=self.service_name,
-            password=self.password,
-            sentinel_password=self.sentinel_password,
-            redis_helper_config=self.redis_helper_config,
-            use_tls=self.use_tls,
-            tls_skip_verify=self.tls_skip_verify,
-            tls_ca_file=self.tls_ca_file,
-        )
+        return dataclasses.replace(self)
 
     def to_valkey_target(self) -> ValkeyTarget:
         addr = str(self.addr) if self.addr else None
@@ -2100,6 +2092,7 @@ class RedisTarget:
             use_tls=self.use_tls,
             tls_skip_verify=self.tls_skip_verify,
             tls_ca_file=self.tls_ca_file,
+            username=self.username,
         )
 
 
@@ -2121,6 +2114,7 @@ class ValkeyProfileTarget:
         use_tls: bool = False,
         tls_skip_verify: bool = False,
         tls_ca_file: str | None = None,
+        username: str | None = None,
     ) -> None:
         self._base_target = ValkeyTarget(
             addr=addr,
@@ -2132,10 +2126,18 @@ class ValkeyProfileTarget:
             use_tls=use_tls,
             tls_skip_verify=tls_skip_verify,
             tls_ca_file=tls_ca_file,
+            username=username,
         )
         self._override_targets = override_targets
 
     def profile_target(self, role: RedisRole) -> ValkeyTarget:
+        """
+        Return the override target for the role, or the base target if there is none.
+
+        An override is a complete target: it inherits nothing from the base, including
+        the username and password, so a role pointed at another server authenticates
+        only with the credentials given in its own override.
+        """
         if self._override_targets and (role in self._override_targets):
             return self._override_targets[role]
         return self._base_target
@@ -2160,6 +2162,7 @@ class RedisProfileTarget:
         use_tls: bool = False,
         tls_skip_verify: bool = False,
         tls_ca_file: str | None = None,
+        username: str | None = None,
     ) -> None:
         self._base_target = RedisTarget(
             addr=addr,
@@ -2171,10 +2174,18 @@ class RedisProfileTarget:
             use_tls=use_tls,
             tls_skip_verify=tls_skip_verify,
             tls_ca_file=tls_ca_file,
+            username=username,
         )
         self._override_targets = override_targets
 
     def profile_target(self, role: RedisRole) -> RedisTarget:
+        """
+        Return the override target for the role, or the base target if there is none.
+
+        An override is a complete target: it inherits nothing from the base, including
+        the username and password, so a role pointed at another server authenticates
+        only with the credentials given in its own override.
+        """
         if self._override_targets and (role in self._override_targets):
             return self._override_targets[role]
         return self._base_target
@@ -2224,6 +2235,7 @@ class RedisProfileTarget:
             use_tls=data.get("use_tls", False),
             tls_skip_verify=data.get("tls_skip_verify", False),
             tls_ca_file=data.get("tls_ca_file"),
+            username=data.get("username"),
         )
 
 

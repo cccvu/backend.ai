@@ -32,3 +32,21 @@ class TestRedisConfigTls:
         assert target.use_tls is True
         assert target.tls_skip_verify is False
         assert target.tls_ca_file == CA_FILE
+
+
+class TestRedisConfigUsername:
+    def test_no_username_by_default(self) -> None:
+        config = RedisConfig.model_validate({"addr": {"host": "127.0.0.1", "port": 6379}})
+        target = RedisProfileTarget.from_dict(config.to_dict()).profile_target(RedisRole.LIVE)
+        assert target.username is None
+
+    def test_valkey_target_carries_username(self) -> None:
+        config = RedisConfig.model_validate({
+            "addr": {"host": "127.0.0.1", "port": 6379},
+            "username": "proxy-user",
+            "password": "secret",
+        })
+        profile = RedisProfileTarget.from_dict(config.to_dict())
+        target = profile.profile_target(RedisRole.LIVE).to_valkey_target()
+        assert target.username == "proxy-user"
+        assert target.password == "secret"

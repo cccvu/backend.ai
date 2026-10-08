@@ -9,6 +9,7 @@ import hiredis
 
 from ai.backend.logging import BraceStyleAdapter
 
+from .exception import InvalidConfigError
 from .types import RedisTarget, aobject
 
 __all__ = (
@@ -242,7 +243,10 @@ class RedisConnection(AbstractAsyncContextManager[RedisClient]):
 
         host = str(redis_url[0])
         port = redis_url[1]
+        username = self._redis_target.username
         password = self._redis_target.password
+        if username and not password:
+            raise InvalidConfigError("A Redis username is configured without a password")
 
         async with asyncio.timeout(self._socket_connect_timeout):
             reader, writer = await asyncio.open_connection(host, port)
@@ -259,7 +263,7 @@ class RedisConnection(AbstractAsyncContextManager[RedisClient]):
 
         if password:
             await client.execute(
-                ["AUTH", password],
+                ["AUTH", username, password] if username else ["AUTH", password],
                 command_timeout=self._socket_timeout,
             )
 

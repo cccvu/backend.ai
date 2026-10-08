@@ -165,6 +165,18 @@ class RedisConfig(BaseSchema):
             example=ConfigExample(local="mymaster", prod="bai-service"),
         ),
     ]
+    username: Annotated[
+        str | None,
+        Field(default=None),
+        BackendAIConfigMeta(
+            description=(
+                "ACL user to authenticate as. "
+                "If None, the server's default user is used. Requires password."
+            ),
+            added_version="26.8.4",
+            example=ConfigExample(local="", prod="backend-ai"),
+        ),
+    ]
     password: Annotated[
         str | None,
         Field(default=None),
