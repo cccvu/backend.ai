@@ -82,22 +82,31 @@ class KernelEventHandler:
         except Exception:
             log.exception("handle_kernel_log: failed to load kernel {}", event.kernel_id)
             return
-        if row is None or row.agent is None or row.container_id is None:
-            log.warning("handle_kernel_log: kernel {} has no container to sync", event.kernel_id)
+        if row is None or row.agent is None:
+            log.warning("handle_kernel_log: kernel {} has no agent to sync from", event.kernel_id)
             return
-        if row.agent != source or row.container_id != event.container_id:
+        # A kernel that failed to start has no container recorded, but its agent still sends
+        # the container's logs: take the container from the event then. The key stays scoped by
+        # the kernel's agent, so only that agent's own logs are ever read.
+        recorded = row.container_id is not None
+        if (
+            row.agent != source
+            or not event.container_id
+            or (recorded and row.container_id != event.container_id)
+        ):
             log.warning(
                 "handle_kernel_log: ignoring logs of kernel {} sent by agent {} "
-                "(kernel agent: {}, container matches: {})",
+                "(kernel agent: {}, container recorded: {}, container matches: {})",
                 event.kernel_id,
                 source,
                 row.agent,
+                recorded,
                 row.container_id == event.container_id,
             )
             return
-        # The key is built from the kernel row, never from the event.
+        # The agent part of the key comes from the kernel row, never from the event.
         agent_id = AgentId(row.agent)
-        container_id = str(row.container_id)
+        container_id = str(row.container_id if recorded else event.container_id)
         try:
             try:
                 log_data = await self._read_container_logs(agent_id, container_id)

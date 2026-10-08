@@ -130,14 +130,28 @@ class TestHandleKernelLog:
         assert fake.deleted == [KEY]
         assert f"containerlog.{OTHER_AGENT}.{CONTAINER_ID}" in fake.lists
 
+    async def test_unstarted_kernel_reads_the_events_container(self) -> None:
+        # A kernel that failed to start has no container recorded; its agent's logs still sync.
+        fake = _FakeLists()
+        fake.lists[KEY] = [_chunk(b"failed to start\n")]
+        db = _FakeDB(_row(container_id=None))
+
+        await _make_handler(fake, db).handle_kernel_log(None, AGENT, _event())
+
+        assert db.stored_logs == [b"failed to start\n"]
+        assert fake.deleted == [KEY]
+
     @pytest.mark.parametrize(
         ("source", "row", "event_container_id"),
         [
             pytest.param(OTHER_AGENT, _row(), CONTAINER_ID, id="other-agent"),
             pytest.param(AGENT, _row(), "other-container", id="other-container"),
             pytest.param(AGENT, _row(agent=None), CONTAINER_ID, id="no-agent"),
-            pytest.param(AGENT, _row(container_id=None), CONTAINER_ID, id="no-container"),
             pytest.param(AGENT, None, CONTAINER_ID, id="no-kernel"),
+            pytest.param(
+                OTHER_AGENT, _row(container_id=None), CONTAINER_ID, id="unstarted-other-agent"
+            ),
+            pytest.param(AGENT, _row(container_id=None), "", id="unstarted-no-container"),
         ],
     )
     async def test_unbound_sync_is_dropped(
