@@ -23,7 +23,10 @@ from ai.backend.manager.services.etcd_config.actions.get_vfolder_types import (
     GetVfolderTypesAction,
 )
 from ai.backend.manager.services.etcd_config.actions.set_config import SetConfigAction
-from ai.backend.manager.services.etcd_config.service import EtcdConfigService
+from ai.backend.manager.services.etcd_config.service import (
+    KNOWN_SLOT_METADATA,
+    EtcdConfigService,
+)
 
 
 class TestEtcdConfigService:
@@ -295,6 +298,106 @@ class TestGetResourceMetadata(TestEtcdConfigService):
         assert "custom.accelerator" in result.metadata
         assert result.metadata["custom.accelerator"]["human_readable_name"] == "Custom Accel"
         assert "cpu" in result.metadata
+        mock_valkey_stat.get_computer_metadata.assert_awaited_once_with(["custom.accelerator"])
+
+    async def test_known_slots_never_read_from_valkey(
+        self,
+        service: EtcdConfigService,
+        mock_config_provider: MagicMock,
+        mock_valkey_stat: AsyncMock,
+    ) -> None:
+        mock_config_provider.legacy_etcd_config_loader.get_resource_slots = AsyncMock(
+            return_value={
+                SlotName("cpu"): "count",
+                SlotName("mem"): "bytes",
+                SlotName("cuda.device"): "count",
+            }
+        )
+        action = GetResourceMetadataAction(sgroup=None)
+
+        result = await service.get_resource_metadata(action)
+
+        mock_valkey_stat.get_computer_metadata.assert_not_called()
+        assert result.metadata == {
+            "cpu": KNOWN_SLOT_METADATA["cpu"],
+            "mem": KNOWN_SLOT_METADATA["mem"],
+            "cuda.device": KNOWN_SLOT_METADATA["cuda.device"],
+        }
+
+    async def test_reported_metadata_requested_only_for_unknown_slots(
+        self,
+        service: EtcdConfigService,
+        mock_config_provider: MagicMock,
+        mock_valkey_stat: AsyncMock,
+    ) -> None:
+        mock_config_provider.legacy_etcd_config_loader.get_resource_slots = AsyncMock(
+            return_value={
+                SlotName("cpu"): "count",
+                SlotName("cuda.device"): "count",
+                SlotName("custom.accelerator"): "count",
+            }
+        )
+        mock_valkey_stat.get_computer_metadata.return_value = {}
+        action = GetResourceMetadataAction(sgroup=None)
+
+        result = await service.get_resource_metadata(action)
+
+        mock_valkey_stat.get_computer_metadata.assert_awaited_once_with(["custom.accelerator"])
+        assert result.metadata["cuda.device"] == KNOWN_SLOT_METADATA["cuda.device"]
+        assert "custom.accelerator" not in result.metadata
+
+    @pytest.mark.parametrize(
+        "malformed",
+        [
+            pytest.param(b"{not json", id="invalid-json"),
+            pytest.param(b"\xff\xfe", id="invalid-utf8"),
+            pytest.param(b'["a", "list"]', id="not-an-object"),
+            pytest.param(b'{"slot_name": "broken.device"}', id="missing-fields"),
+            pytest.param(
+                json.dumps({
+                    "slot_name": "broken.device",
+                    "human_readable_name": "Broken",
+                    "description": "Broken",
+                    "display_unit": "Device",
+                    "number_format": "not-a-format",
+                    "display_icon": "broken",
+                }).encode(),
+                id="wrong-field-type",
+            ),
+        ],
+    )
+    async def test_malformed_reported_entry_is_skipped(
+        self,
+        service: EtcdConfigService,
+        mock_config_provider: MagicMock,
+        mock_valkey_stat: AsyncMock,
+        malformed: bytes,
+    ) -> None:
+        mock_config_provider.legacy_etcd_config_loader.get_resource_slots = AsyncMock(
+            return_value={
+                SlotName("cpu"): "count",
+                SlotName("broken.device"): "count",
+                SlotName("custom.accelerator"): "count",
+            }
+        )
+        custom_metadata = {
+            "slot_name": "custom.accelerator",
+            "human_readable_name": "Custom Accel",
+            "description": "A custom accelerator",
+            "display_unit": "Device",
+            "number_format": {"binary": False, "round_length": 0},
+            "display_icon": "custom",
+        }
+        mock_valkey_stat.get_computer_metadata.return_value = {
+            "broken.device": malformed,
+            "custom.accelerator": json.dumps(custom_metadata).encode(),
+        }
+        action = GetResourceMetadataAction(sgroup=None)
+
+        result = await service.get_resource_metadata(action)
+
+        assert set(result.metadata) == {"cpu", "custom.accelerator"}
+        assert result.metadata["custom.accelerator"] == custom_metadata
 
 
 class TestGetVfolderTypes(TestEtcdConfigService):

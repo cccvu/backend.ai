@@ -518,45 +518,6 @@ class ValkeyStatClient:
         return stats
 
     @valkey_stat_resilience.apply()
-    async def get_image_distro(self, image_id: str) -> str | None:
-        """
-        Get cached Linux distribution for a Docker image.
-
-        :param image_id: The Docker image ID.
-        :return: The distribution name, or None if not found.
-        """
-        batch = self._create_batch()
-        key = f"image:{image_id}:distro"
-        batch.get(key)
-        batch.expire(key, _DEFAULT_EXPIRATION)
-        async with self._client.client() as conn:
-            results = await conn.exec(batch, raise_on_error=True)
-        if not results:
-            return None
-        try:
-            result = cast(bytes | None, results[0])
-            if not result:
-                return None
-            return result.decode("utf-8")
-        except UnicodeDecodeError:
-            return None
-
-    @valkey_stat_resilience.apply()
-    async def set_image_distro(self, image_id: str, distro: str) -> None:
-        """
-        Cache Linux distribution for a Docker image.
-
-        :param image_id: The Docker image ID.
-        :param distro: The Linux distribution name.
-        """
-        async with self._client.client() as conn:
-            await conn.set(
-                f"image:{image_id}:distro",
-                distro,
-                expiry=ExpirySet(ExpiryType.SEC, _DEFAULT_EXPIRATION),
-            )
-
-    @valkey_stat_resilience.apply()
     async def get_volume_usage(self, proxy_name: str, volume_name: str) -> bytes | None:
         """
         Get volume usage information.
@@ -605,20 +566,23 @@ class ValkeyStatClient:
             )
 
     @valkey_stat_resilience.apply()
-    async def get_computer_metadata(self) -> dict[str, bytes]:
+    async def get_computer_metadata(self, slot_names: Sequence[str]) -> dict[str, bytes]:
         """
-        Get all computer metadata from the hash.
+        Get the computer metadata of the given slots from the hash.
 
-        :return: Dictionary of slot name to metadata JSON string.
+        :param slot_names: The slot names to read.
+        :return: Dictionary of slot name to metadata JSON, for the slots present in the hash.
         """
+        if not slot_names:
+            return {}
+        fields = list(slot_names)
         async with self._client.client() as conn:
-            result = await conn.hgetall(_COMPUTER_METADATA_KEY)
-        # Convert bytes keys and values to strings
-        metadata: dict[str, bytes] = {}
-        for key, value in result.items():
-            str_key: str = key.decode("utf-8")
-            metadata[str_key] = value
-        return metadata
+            values = await conn.hmget(_COMPUTER_METADATA_KEY, cast(list[str | bytes], fields))
+        return {
+            slot_name: value
+            for slot_name, value in zip(fields, values, strict=True)
+            if value is not None
+        }
 
     @valkey_stat_resilience.apply()
     async def _get_raw(self, key: str) -> bytes | None:

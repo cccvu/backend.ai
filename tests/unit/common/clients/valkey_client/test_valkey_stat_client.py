@@ -64,6 +64,22 @@ class TestValkeyStatClient:
         deleted_count = await test_valkey_stat.delete(test_keys)
         assert deleted_count == len(test_keys)
 
+    async def test_get_computer_metadata_reads_only_requested_slots(
+        self, test_valkey_stat: ValkeyStatClient
+    ) -> None:
+        suffix = uuid.uuid4().hex[:8]
+        requested = f"requested-{suffix}.device"
+        other = f"other-{suffix}.device"
+        missing = f"missing-{suffix}.device"
+        await test_valkey_stat.store_computer_metadata({
+            requested: b'{"slot_name": "requested"}',
+            other: b'{"slot_name": "other"}',
+        })
+
+        result = await test_valkey_stat.get_computer_metadata([requested, missing])
+
+        assert result == {requested: b'{"slot_name": "requested"}'}
+        assert await test_valkey_stat.get_computer_metadata([]) == {}
 
 class TestAgentScopedKernelKeys:
     """Kernel statistics and commit statuses are stored under the hosting agent's ID."""
