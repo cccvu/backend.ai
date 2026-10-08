@@ -859,6 +859,7 @@ class AbstractAgent[
 
     _pending_creation_tasks: dict[KernelId, set[asyncio.Task[Any]]]
     _ongoing_exec_batch_tasks: weakref.WeakSet[asyncio.Task[Any]]
+    _batch_started_kernels: set[KernelId]
     _ongoing_destruction_tasks: weakref.WeakValueDictionary[KernelId, asyncio.Task[Any]]
     _ongoing_model_service_tasks: set[asyncio.Task[None]]
     _metric_registry: CommonMetricRegistry
@@ -944,6 +945,7 @@ class AbstractAgent[
         self.error_monitor = error_monitor
         self._pending_creation_tasks = defaultdict(set)
         self._ongoing_exec_batch_tasks = weakref.WeakSet()
+        self._batch_started_kernels = set()
         self._ongoing_destruction_tasks = weakref.WeakValueDictionary()
         self._ongoing_model_service_tasks = set()
         self._metric_registry = CommonMetricRegistry.instance()
@@ -1531,6 +1533,9 @@ class AbstractAgent[
             else:
                 log.info("Kernel {0} cleaned", ev.kernel_id)
             finally:
+                # The container that ran the batch job is gone, either for good or
+                # to be re-created by a restart, so allow triggering it again.
+                self._batch_started_kernels.discard(ev.kernel_id)
                 if ev.kernel_id in self.restarting_kernels:
                     # Don't forget as we are restarting it.
                     kernel_obj = self.kernel_registry.get(ev.kernel_id, None)
@@ -1642,6 +1647,7 @@ class AbstractAgent[
         else:
             log.info("cleaned kernel object (kernel:{})", kernel_id)
         finally:
+            self._batch_started_kernels.discard(kernel_id)
             try:
                 del self.kernel_registry[kernel_id]
             except KeyError:
@@ -2497,6 +2503,23 @@ class AbstractAgent[
         code_to_execute: str,
         timeout_seconds: float | None = None,
     ) -> None:
+        # Make repeated triggers for the same kernel (e.g., manager retries after a lost
+        # reply) idempotent so that the batch job is not executed twice.
+        # The marker is kept in memory only and set in the same synchronous step as the
+        # task spawn: if the agent dies, the marker dies with it and a later retry starts
+        # the batch job again, instead of a persisted marker skipping it forever.
+        if kernel_id not in self.kernel_registry:
+            # Nothing to run, and no marker to leave behind: only CLEAN clears it.
+            log.warning("create_batch_execution_task(k:{}): no such kernel", kernel_id)
+            return
+        if kernel_id in self._batch_started_kernels:
+            log.info(
+                "create_batch_execution_task(k:{}): batch execution already started, "
+                "ignoring the duplicate trigger",
+                kernel_id,
+            )
+            return
+        self._batch_started_kernels.add(kernel_id)
         self._ongoing_exec_batch_tasks.add(
             asyncio.create_task(
                 self.execute_batch(session_id, kernel_id, code_to_execute, timeout_seconds),

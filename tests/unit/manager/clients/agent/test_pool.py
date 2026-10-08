@@ -21,14 +21,16 @@ The fix has two responsibilities, tested independently:
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
+from uuid import uuid4
 
 import pytest
 
 from ai.backend.common.clients.agent.client import AgentClient
 from ai.backend.common.clients.agent.peer import PeerInvoker
-from ai.backend.common.types import AgentId
+from ai.backend.common.types import AgentId, KernelId
 from ai.backend.manager.clients.agent.pool import AgentClientPool
 from ai.backend.manager.clients.agent.types import AgentPoolSpec
 from ai.backend.manager.errors.agent import AgentConnectionUnavailable
@@ -145,5 +147,45 @@ class TestCreateEntryConnectFailure:
             "subsequent acquire must short-circuit via cached unhealthy entry, "
             "not create another PeerInvoker (each one allocates a zmq.Context)"
         )
+
+        await pool.close()
+
+
+class _HangingPeer:
+    """Stand-in peer that connects but never answers ``check_running``."""
+
+    def __init__(self) -> None:
+        self.call = MagicMock()
+        self.call.check_running = AsyncMock(side_effect=self._hang)
+
+    async def _hang(self, *args: Any, **kwargs: Any) -> Any:
+        await asyncio.Event().wait()
+
+    async def __aenter__(self) -> _HangingPeer:
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        pass
+
+
+class TestCallSiteTimeout:
+    """A timeout wrapped around ``acquire()`` reaches the pool as a cancellation."""
+
+    async def test_call_site_timeout_does_not_count_as_connection_failure(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pool = _make_pool()
+        monkeypatch.setattr(pool, "_create_peer", lambda *a, **kw: _HangingPeer())
+        agent_id = AgentId("i-slow")
+
+        with pytest.raises(TimeoutError):
+            async with asyncio.timeout(0.05):
+                async with pool.acquire(agent_id) as client:
+                    await client.check_running(KernelId(uuid4()))
+
+        entry = pool._entries[agent_id]
+        assert entry.failure_count == 0
+        assert entry.is_healthy is True
 
         await pool.close()

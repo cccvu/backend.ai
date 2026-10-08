@@ -31,7 +31,13 @@ from ai.backend.common.types import (
 from ai.backend.logging.utils import BraceStyleAdapter
 from ai.backend.manager.clients.agent import AgentClientPool
 from ai.backend.manager.config.provider import ManagerConfigProvider
-from ai.backend.manager.defs import START_SESSION_TIMEOUT_SEC
+from ai.backend.manager.defs import (
+    AGENT_ASSIGN_PORT_TIMEOUT_SEC,
+    AGENT_CHECK_AND_PULL_TIMEOUT_SEC,
+    AGENT_CREATE_KERNELS_TIMEOUT_SEC,
+    AGENT_NETWORK_RPC_TIMEOUT_SEC,
+    START_SESSION_TIMEOUT_SEC,
+)
 from ai.backend.manager.exceptions import convert_to_status_data
 from ai.backend.manager.metrics.scheduler import (
     SchedulerPhaseMetricObserver,
@@ -141,11 +147,14 @@ class SessionLauncher:
         async def pull_for_agent(
             agent_id: AgentId, images: dict[str, ImageConfig]
         ) -> Mapping[str, str]:
-            async with self._agent_client_pool.acquire(agent_id) as client:
-                return await client.check_and_pull(images)
+            async with asyncio.timeout(AGENT_CHECK_AND_PULL_TIMEOUT_SEC):
+                async with self._agent_client_pool.acquire(agent_id) as client:
+                    return await client.check_and_pull(images)
 
+        pull_agent_ids: list[AgentId] = []
         pull_tasks: list[Awaitable[Mapping[str, str]]] = []
         for agent_id, agent_images in agent_image_configs.items():
+            pull_agent_ids.append(agent_id)
             pull_tasks.append(pull_for_agent(agent_id, agent_images))
 
         if pull_tasks:
@@ -157,7 +166,14 @@ class SessionLauncher:
                     "check_and_pull_images",
                     success_detail="Image pull triggered",
                 ):
-                    await asyncio.gather(*pull_tasks, return_exceptions=True)
+                    pull_results = await asyncio.gather(*pull_tasks, return_exceptions=True)
+            for agent_id, pull_result in zip(pull_agent_ids, pull_results, strict=True):
+                if isinstance(pull_result, BaseException):
+                    log.warning(
+                        "Failed to trigger image pulling on agent {}: {!r}",
+                        agent_id,
+                        pull_result,
+                    )
 
     async def start_sessions_for_handler(
         self,
@@ -403,14 +419,15 @@ class SessionLauncher:
                 }
 
                 # Create the kernels using connection pool
-                async with self._agent_client_pool.acquire(agent_id) as client:
-                    await client.create_kernels(
-                        session.session_id,
-                        kernel_ids,
-                        kernel_configs,
-                        cluster_info,
-                        kernel_image_refs,
-                    )
+                async with asyncio.timeout(AGENT_CREATE_KERNELS_TIMEOUT_SEC):
+                    async with self._agent_client_pool.acquire(agent_id) as client:
+                        await client.create_kernels(
+                            session.session_id,
+                            kernel_ids,
+                            kernel_configs,
+                            cluster_info,
+                            kernel_image_refs,
+                        )
 
             agent_ids_ordered: list[AgentId] = []
             create_tasks: list[Awaitable[None]] = []
@@ -420,16 +437,17 @@ class SessionLauncher:
 
             if create_tasks:
                 results = await asyncio.gather(*create_tasks, return_exceptions=True)
-                failed_agent_ids = [
-                    aid
+                failures = {
+                    aid: result
                     for aid, result in zip(agent_ids_ordered, results, strict=True)
                     if isinstance(result, BaseException)
-                ]
+                }
+                failed_agent_ids = list(failures)
                 if failed_agent_ids:
                     log.warning(
                         log_fmt + "recording failed agents: {}",
                         *log_args,
-                        failed_agent_ids,
+                        {aid: repr(exc) for aid, exc in failures.items()},
                     )
                     try:
                         await self._valkey_schedule.record_session_failed_agents(
@@ -483,8 +501,9 @@ class SessionLauncher:
                 if not first_kernel.agent_id:
                     raise ValueError(f"No agent assigned for kernel {first_kernel.kernel_id}")
                 try:
-                    async with self._agent_client_pool.acquire(first_kernel.agent_id) as client:
-                        await client.create_local_network(network_name)
+                    async with asyncio.timeout(AGENT_NETWORK_RPC_TIMEOUT_SEC):
+                        async with self._agent_client_pool.acquire(first_kernel.agent_id) as client:
+                            await client.create_local_network(network_name)
                 except Exception:
                     log.exception("Failed to create agent-local network {}", network_name)
                     raise
@@ -537,8 +556,9 @@ class SessionLauncher:
                             kernel.kernel_id,
                         )
                         continue
-                    async with self._agent_client_pool.acquire(kernel.agent_id) as client:
-                        port = await client.assign_port()
+                    async with asyncio.timeout(AGENT_ASSIGN_PORT_TIMEOUT_SEC):
+                        async with self._agent_client_pool.acquire(kernel.agent_id) as client:
+                            port = await client.assign_port()
                     # Extract host from agent_addr
                     agent_addr = kernel.agent_addr or ""
                     agent_host = (

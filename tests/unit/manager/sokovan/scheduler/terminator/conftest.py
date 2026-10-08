@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Callable
 from contextlib import asynccontextmanager
 from datetime import datetime
 from decimal import Decimal
@@ -148,6 +148,18 @@ def _create_terminating_session_data(
 
 
 @pytest.fixture
+def terminating_kernel_factory() -> Callable[..., TerminatingKernelData]:
+    """Factory for TerminatingKernelData."""
+    return _create_terminating_kernel_data
+
+
+@pytest.fixture
+def terminating_session_factory() -> Callable[..., TerminatingSessionData]:
+    """Factory for TerminatingSessionData."""
+    return _create_terminating_session_data
+
+
+@pytest.fixture
 def terminating_session_single_kernel() -> TerminatingSessionData:
     """Single session with one kernel for termination."""
     return _create_terminating_session_data()
@@ -283,6 +295,12 @@ def _create_kernel_info(
         metrics=KernelMetrics(num_queries=0, last_stat=None, container_log=None),
         metadata=KernelMetadata(callback_url=None, internal_data=None),
     )
+
+
+@pytest.fixture
+def kernel_info_factory() -> Callable[..., KernelInfo]:
+    """Factory for KernelInfo."""
+    return _create_kernel_info
 
 
 @pytest.fixture

@@ -11,14 +11,19 @@ Test Scenarios:
 
 from __future__ import annotations
 
+import asyncio
+import time
 import uuid
 from collections.abc import Callable
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from ai.backend.common.identifier.resource_group import ResourceGroupID
+from ai.backend.common.types import AgentId, SessionId
 from ai.backend.manager.data.session.types import SessionStatus
+from ai.backend.manager.sokovan.recorder.context import RecorderContext
 from ai.backend.manager.sokovan.scheduler.handlers.lifecycle.check_precondition import (
     CheckPreconditionLifecycleHandler,
 )
@@ -32,6 +37,11 @@ from ai.backend.manager.sokovan.scheduler.handlers.lifecycle.terminate_sessions 
     TerminateSessionsLifecycleHandler,
 )
 from ai.backend.manager.sokovan.scheduler.results import ScheduleResult, SchedulingSkip
+from ai.backend.manager.sokovan.scheduler.terminator import terminator as terminator_module
+from ai.backend.manager.sokovan.scheduler.terminator.terminator import (
+    SessionTerminator,
+    SessionTerminatorArgs,
+)
 from ai.backend.manager.views.sokovan.allocation import SchedulingFailure
 from ai.backend.manager.views.sokovan.lifecycle import (
     SessionsForPullWithImages,
@@ -886,3 +896,63 @@ class TestTerminateSessionsLifecycleHandler:
         # Assert
         expected_ids = [s.session_info.identity.id for s in terminating_sessions_multiple]
         mock_repository.get_terminating_sessions_by_ids.assert_awaited_once_with(expected_ids)
+
+
+class TestTerminateSessionsWithUnresponsiveAgent:
+    """TerminateSessionsLifecycleHandler with a real SessionTerminator.
+
+    An agent that accepts destroy_kernel and never replies must not hold up the
+    destroy requests for sessions on other agents.
+    """
+
+    @pytest.fixture
+    def handler(
+        self,
+        per_agent_client_pool: MagicMock,
+        mock_repository: AsyncMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> TerminateSessionsLifecycleHandler:
+        monkeypatch.setattr(terminator_module, "AGENT_DESTROY_KERNEL_TIMEOUT_SEC", 0.1)
+        terminator = SessionTerminator(
+            SessionTerminatorArgs(
+                repository=mock_repository,
+                agent_client_pool=per_agent_client_pool,
+                valkey_schedule=AsyncMock(),
+            )
+        )
+        return TerminateSessionsLifecycleHandler(
+            terminator=terminator,
+            repository=mock_repository,
+        )
+
+    async def test_sessions_on_other_agents_still_destroyed(
+        self,
+        handler: TerminateSessionsLifecycleHandler,
+        per_agent_client_pool: MagicMock,
+        mock_repository: AsyncMock,
+        terminating_sessions_multiple: list[SessionWithKernels],
+        terminating_session_data_factory: Callable[..., list[TerminatingSessionData]],
+    ) -> None:
+        hung_agent = AgentId("agent-hung")
+        healthy_agent = AgentId("agent-healthy")
+        hung_data, healthy_data = terminating_session_data_factory(terminating_sessions_multiple)
+        for kernel in hung_data.kernels:
+            kernel.agent_id = hung_agent
+        for kernel in healthy_data.kernels:
+            kernel.agent_id = healthy_agent
+        mock_repository.get_terminating_sessions_by_ids.return_value = [hung_data, healthy_data]
+
+        async def hang(*args: Any, **kwargs: Any) -> None:
+            await asyncio.Event().wait()
+
+        per_agent_client_pool.client(hung_agent).destroy_kernel.side_effect = hang
+
+        session_ids = [hung_data.session_id, healthy_data.session_id]
+        started = time.monotonic()
+        with RecorderContext[SessionId].scope("terminate", entity_ids=session_ids):
+            await handler.execute(ResourceGroupID(uuid.uuid4()), terminating_sessions_multiple)
+        elapsed = time.monotonic() - started
+
+        healthy_client = per_agent_client_pool.client(healthy_agent)
+        assert healthy_client.destroy_kernel.await_count == len(healthy_data.kernels)
+        assert elapsed < 1.0

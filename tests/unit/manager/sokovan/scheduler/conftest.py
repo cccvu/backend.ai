@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from decimal import Decimal
+from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
 import pytest
 from dateutil.tz import tzutc
 
+from ai.backend.common.clients.agent.client import AgentClient
 from ai.backend.common.identifier.architecture import ArchName
 from ai.backend.common.identifier.domain import DomainID
 from ai.backend.common.identifier.project import ProjectID
@@ -26,6 +29,7 @@ from ai.backend.common.types import (
     SessionId,
     SessionTypes,
 )
+from ai.backend.manager.clients.agent import AgentClientPool
 from ai.backend.manager.data.kernel.types import KernelStatus
 from ai.backend.manager.data.session.options import AgentSelectionPolicy
 from ai.backend.manager.data.session.types import (
@@ -336,6 +340,35 @@ def status_transitions_success_only() -> StatusTransitions:
 def empty_system_snapshot() -> SystemSnapshot:
     """Create an empty system snapshot for testing."""
     return create_system_snapshot()
+
+
+# =============================================================================
+# Agent client fixtures
+# =============================================================================
+
+
+@pytest.fixture
+def per_agent_client_pool() -> MagicMock:
+    """AgentClientPool stand-in that hands out one stub client per agent.
+
+    ``pool.client(agent_id)`` returns that agent's client (created on first use),
+    so a test can make one agent hang while the others answer.
+    """
+    pool = MagicMock(spec=AgentClientPool)
+    clients: dict[AgentId, AsyncMock] = {}
+
+    def client(agent_id: AgentId) -> AsyncMock:
+        if agent_id not in clients:
+            clients[agent_id] = AsyncMock(spec=AgentClient)
+        return clients[agent_id]
+
+    @asynccontextmanager
+    async def acquire(agent_id: AgentId) -> AsyncIterator[AsyncMock]:
+        yield client(agent_id)
+
+    pool.acquire = MagicMock(side_effect=acquire)
+    pool.client = client
+    return pool
 
 
 __all__ = [
