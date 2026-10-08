@@ -65,21 +65,24 @@ class CleanupForceTerminatedHandler(CleanupHandler):
             await self._valkey_schedule.remove_force_terminated_sessions(session_ids)
             return
 
-        succeeded_ids: list[SessionId] = []
-        for session_data in terminating_sessions:
-            try:
-                await self._terminator.terminate_sessions_for_handler([session_data])
-                succeeded_ids.append(session_data.session_id)
-            except Exception:
-                log.exception(
-                    "Failed to send cleanup RPC for force-terminated session {}",
-                    session_data.session_id,
-                )
+        # One call for all sessions: the destroy requests run concurrently, so an
+        # unresponsive agent does not hold up the cleanup of the others.
+        try:
+            succeeded_ids = await self._terminator.terminate_sessions_for_handler(
+                terminating_sessions
+            )
+        except Exception:
+            log.exception(
+                "Failed to send cleanup RPCs for {} force-terminated sessions",
+                len(terminating_sessions),
+            )
+            return
 
+        failed_count = len(terminating_sessions) - len(succeeded_ids)
         if succeeded_ids:
             await self._valkey_schedule.remove_force_terminated_sessions(succeeded_ids)
-            log.info(
-                "Cleaned up {} force-terminated sessions ({} failed)",
-                len(succeeded_ids),
-                len(terminating_sessions) - len(succeeded_ids),
-            )
+        log.info(
+            "Cleaned up {} force-terminated sessions ({} failed, retried on the next cycle)",
+            len(succeeded_ids),
+            failed_count,
+        )
