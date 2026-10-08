@@ -1718,11 +1718,22 @@ class AgentRegistry:
         self,
         kernel_ids: Sequence[KernelId],
     ) -> Mapping[KernelId, str]:
-        kernel_ids_str = [str(kernel_id) for kernel_id in kernel_ids]
-        commit_statuses = await self.valkey_stat.get_kernel_commit_statuses(kernel_ids_str)
+        if not kernel_ids:
+            return {}
+        # The commit status is reported by the agent hosting each kernel.
+        async with self.db.begin_readonly() as db_conn:
+            query = sa.select(KernelRow.id, KernelRow.agent).where(KernelRow.id.in_(kernel_ids))
+            kernel_agents = {row.id: row.agent for row in await db_conn.execute(query)}
+        commit_statuses = await self.valkey_stat.get_kernel_commit_statuses([
+            (kernel_agents.get(kernel_id), str(kernel_id)) for kernel_id in kernel_ids
+        ])
 
         return {
-            kernel_id: str(result, "utf-8") if result is not None else CommitStatus.READY.value
+            kernel_id: (
+                result.decode("utf-8", errors="replace")
+                if result is not None
+                else CommitStatus.READY.value
+            )
             for kernel_id, result in zip(kernel_ids, commit_statuses, strict=True)
         }
 

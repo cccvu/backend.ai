@@ -289,22 +289,22 @@ def clear_history(cli_ctx: CLIContext, retention: str, vacuum_full: bool) -> Non
             async with connect_database(bootstrap_config.db) as db:
                 async with db.begin_readonly() as conn:
                     query = (
-                        sa.select(kernels.c.id)
+                        sa.select(kernels.c.id, kernels.c.agent)
                         .select_from(kernels)
                         .where(
                             (kernels.c.terminated_at < expiration_date),
                         )
                     )
                     result = await conn.execute(query)
-                    target_kernels = [str(x.id) for x in result.all()]
+                    target_kernels = [(x.agent, str(x.id)) for x in result.all()]
 
             delete_count = 0
             async with redis_ctx(cli_ctx) as redis_conn_set:
                 if len(target_kernels) > 0:
                     # Apply chunking to avoid excessive length of command params
                     # and indefinite blocking of the Redis server.
-                    for kernel_ids in chunked(target_kernels, 32):
-                        deleted = await redis_conn_set.stat.delete(kernel_ids)
+                    for chunk in chunked(target_kernels, 32):
+                        deleted = await redis_conn_set.stat.delete_kernel_statistics(chunk)
                         delete_count += deleted
                     log.info(
                         "Cleaned up {:,} redis statistics records older than {:}.",

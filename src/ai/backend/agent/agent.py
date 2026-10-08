@@ -1246,6 +1246,7 @@ class AbstractAgent[
             await loop.run_in_executor(None, _map_commit_status)
             # Update kernel commit statuses using ValkeyStatClient
             await self.valkey_stat_client.update_kernel_commit_statuses(
+                self.id,
                 list(commit_kernels),
                 COMMIT_STATUS_EXPIRE,
             )

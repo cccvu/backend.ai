@@ -16,10 +16,8 @@ import pytest
 
 from ai.backend.agent.observer.orphan_kernel_cleanup import OrphanKernelCleanupObserver
 from ai.backend.agent.types import LifecycleEvent
-from ai.backend.common.clients.valkey_client.valkey_schedule import KernelStatus
 from ai.backend.common.clients.valkey_client.valkey_schedule.client import (
     ORPHAN_KERNEL_THRESHOLD_SEC,
-    HealthCheckStatus,
 )
 from ai.backend.common.events.event_types.kernel.types import KernelLifecycleEventReason
 from ai.backend.common.types import AgentId, KernelId, SessionId
@@ -63,7 +61,7 @@ class TestOrphanKernelCleanupObserver:
 
     These tests verify the strict cleanup conditions:
     - agent_last_check must exist
-    - kernel status must exist in Redis
+    - the manager's kernel last_check must exist in Redis
     - kernel.last_check < agent_last_check - THRESHOLD
     """
 
@@ -82,7 +80,7 @@ class TestOrphanKernelCleanupObserver:
         """Create a mock ValkeyScheduleClient."""
         client = AsyncMock()
         client.get_agent_last_check = AsyncMock(return_value=None)
-        client.get_kernel_presence_batch = AsyncMock(return_value={})
+        client.get_kernel_last_check_batch = AsyncMock(return_value={})
         return client
 
     @pytest.fixture
@@ -134,7 +132,7 @@ class TestOrphanKernelCleanupObserver:
 
         mock_agent.inject_container_lifecycle_event.assert_not_called()
 
-    async def test_skip_when_kernel_status_none(
+    async def test_skip_when_kernel_last_check_missing(
         self,
         observer: OrphanKernelCleanupObserver,
         mock_agent: AsyncMock,
@@ -142,12 +140,12 @@ class TestOrphanKernelCleanupObserver:
         kernel_id: KernelId,
         session_id: SessionId,
     ) -> None:
-        """Test that observe() skips kernel when status is None (no Redis entry)."""
+        """A missing (never written, expired or evicted) last_check key never kills."""
         mock_valkey_client.get_agent_last_check.return_value = 1000
         type(mock_agent).kernel_registry = PropertyMock(
             return_value={kernel_id: MockKernel(session_id=session_id)}
         )
-        mock_valkey_client.get_kernel_presence_batch.return_value = {
+        mock_valkey_client.get_kernel_last_check_batch.return_value = {
             kernel_id: None,  # No Redis entry
         }
 
@@ -155,7 +153,7 @@ class TestOrphanKernelCleanupObserver:
 
         mock_agent.inject_container_lifecycle_event.assert_not_called()
 
-    async def test_skip_when_kernel_last_check_is_none(
+    async def test_skip_when_kernel_last_check_not_returned(
         self,
         observer: OrphanKernelCleanupObserver,
         mock_agent: AsyncMock,
@@ -163,24 +161,37 @@ class TestOrphanKernelCleanupObserver:
         kernel_id: KernelId,
         session_id: SessionId,
     ) -> None:
-        """Test that observe() skips kernel when last_check is None."""
+        """A kernel absent from the result is skipped, even with an old agent last_check."""
+        mock_valkey_client.get_agent_last_check.return_value = 10 * ORPHAN_KERNEL_THRESHOLD_SEC
+        type(mock_agent).kernel_registry = PropertyMock(
+            return_value={kernel_id: MockKernel(session_id=session_id)}
+        )
+        mock_valkey_client.get_kernel_last_check_batch.return_value = {}
+
+        await observer.observe()
+
+        mock_agent.inject_container_lifecycle_event.assert_not_called()
+
+    async def test_reads_own_agent_scoped_keys(
+        self,
+        observer: OrphanKernelCleanupObserver,
+        mock_agent: AsyncMock,
+        mock_valkey_client: AsyncMock,
+        kernel_id: KernelId,
+        session_id: SessionId,
+    ) -> None:
+        """The observer reads the check timestamps under its own agent ID only."""
         mock_valkey_client.get_agent_last_check.return_value = 1000
         type(mock_agent).kernel_registry = PropertyMock(
             return_value={kernel_id: MockKernel(session_id=session_id)}
         )
-        mock_valkey_client.get_kernel_presence_batch.return_value = {
-            kernel_id: KernelStatus(
-                presence=HealthCheckStatus.HEALTHY,
-                last_presence=900,
-                last_check=None,  # last_check is None
-                created_at=800,
-            ),
-        }
 
         await observer.observe()
 
-        # Should not call inject_container_lifecycle_event when last_check is None
-        mock_agent.inject_container_lifecycle_event.assert_not_called()
+        mock_valkey_client.get_agent_last_check.assert_awaited_once_with(mock_agent.id)
+        mock_valkey_client.get_kernel_last_check_batch.assert_awaited_once_with(
+            mock_agent.id, [kernel_id]
+        )
 
     async def test_skip_when_kernel_recently_checked(
         self,
@@ -199,13 +210,8 @@ class TestOrphanKernelCleanupObserver:
         type(mock_agent).kernel_registry = PropertyMock(
             return_value={kernel_id: MockKernel(session_id=session_id)}
         )
-        mock_valkey_client.get_kernel_presence_batch.return_value = {
-            kernel_id: KernelStatus(
-                presence=HealthCheckStatus.HEALTHY,
-                last_presence=kernel_last_check,
-                last_check=kernel_last_check,
-                created_at=0,
-            ),
+        mock_valkey_client.get_kernel_last_check_batch.return_value = {
+            kernel_id: kernel_last_check,
         }
 
         await observer.observe()
@@ -229,13 +235,8 @@ class TestOrphanKernelCleanupObserver:
         type(mock_agent).kernel_registry = PropertyMock(
             return_value={kernel_id: MockKernel(session_id=session_id)}
         )
-        mock_valkey_client.get_kernel_presence_batch.return_value = {
-            kernel_id: KernelStatus(
-                presence=HealthCheckStatus.HEALTHY,
-                last_presence=kernel_last_check,
-                last_check=kernel_last_check,
-                created_at=0,
-            ),
+        mock_valkey_client.get_kernel_last_check_batch.return_value = {
+            kernel_id: kernel_last_check,
         }
 
         await observer.observe()
@@ -259,13 +260,8 @@ class TestOrphanKernelCleanupObserver:
         type(mock_agent).kernel_registry = PropertyMock(
             return_value={kernel_id: MockKernel(session_id=session_id)}
         )
-        mock_valkey_client.get_kernel_presence_batch.return_value = {
-            kernel_id: KernelStatus(
-                presence=HealthCheckStatus.HEALTHY,
-                last_presence=kernel_last_check,
-                last_check=kernel_last_check,
-                created_at=0,
-            ),
+        mock_valkey_client.get_kernel_last_check_batch.return_value = {
+            kernel_id: kernel_last_check,
         }
 
         await observer.observe()
@@ -305,25 +301,10 @@ class TestOrphanKernelCleanupObserver:
                 healthy_kernel: MockKernel(session_id=healthy_session),
             }
         )
-        mock_valkey_client.get_kernel_presence_batch.return_value = {
-            orphan_kernel_1: KernelStatus(
-                presence=HealthCheckStatus.HEALTHY,
-                last_presence=orphan_threshold,
-                last_check=orphan_threshold,
-                created_at=0,
-            ),
-            orphan_kernel_2: KernelStatus(
-                presence=HealthCheckStatus.HEALTHY,
-                last_presence=orphan_threshold,
-                last_check=orphan_threshold,
-                created_at=0,
-            ),
-            healthy_kernel: KernelStatus(
-                presence=HealthCheckStatus.HEALTHY,
-                last_presence=healthy_threshold,
-                last_check=healthy_threshold,
-                created_at=0,
-            ),
+        mock_valkey_client.get_kernel_last_check_batch.return_value = {
+            orphan_kernel_1: orphan_threshold,
+            orphan_kernel_2: orphan_threshold,
+            healthy_kernel: healthy_threshold,
         }
 
         await observer.observe()
@@ -362,19 +343,9 @@ class TestOrphanKernelCleanupObserver:
                 orphan_kernel_2: MockKernel(session_id=orphan_session_2),
             }
         )
-        mock_valkey_client.get_kernel_presence_batch.return_value = {
-            orphan_kernel_1: KernelStatus(
-                presence=HealthCheckStatus.HEALTHY,
-                last_presence=orphan_threshold,
-                last_check=orphan_threshold,
-                created_at=0,
-            ),
-            orphan_kernel_2: KernelStatus(
-                presence=HealthCheckStatus.HEALTHY,
-                last_presence=orphan_threshold,
-                last_check=orphan_threshold,
-                created_at=0,
-            ),
+        mock_valkey_client.get_kernel_last_check_batch.return_value = {
+            orphan_kernel_1: orphan_threshold,
+            orphan_kernel_2: orphan_threshold,
         }
 
         # First call raises exception
@@ -416,19 +387,9 @@ class TestOrphanKernelCleanupObserver:
                 no_redis_kernel: MockKernel(session_id=no_redis_session),
             }
         )
-        mock_valkey_client.get_kernel_presence_batch.return_value = {
-            orphan_kernel: KernelStatus(
-                presence=HealthCheckStatus.STALE,  # Even stale kernel should be cleaned if orphan
-                last_presence=orphan_threshold,
-                last_check=orphan_threshold,
-                created_at=0,
-            ),
-            healthy_kernel: KernelStatus(
-                presence=HealthCheckStatus.HEALTHY,
-                last_presence=healthy_threshold,
-                last_check=healthy_threshold,
-                created_at=0,
-            ),
+        mock_valkey_client.get_kernel_last_check_batch.return_value = {
+            orphan_kernel: orphan_threshold,
+            healthy_kernel: healthy_threshold,
             no_redis_kernel: None,  # No Redis entry - skip
         }
 

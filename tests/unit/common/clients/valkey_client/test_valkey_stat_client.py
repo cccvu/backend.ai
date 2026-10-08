@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import AsyncIterator
+from decimal import Decimal
 
+import msgpack as plain_msgpack
 import pytest
 
+from ai.backend.common import msgpack
 from ai.backend.common.clients.valkey_client.valkey_stat.client import ValkeyStatClient
 from ai.backend.common.defs import REDIS_STATISTICS_DB
 from ai.backend.common.typed_validators import HostPortPair as HostPortPairModel
@@ -60,3 +63,120 @@ class TestValkeyStatClient:
         # Clean up
         deleted_count = await test_valkey_stat.delete(test_keys)
         assert deleted_count == len(test_keys)
+
+
+class TestAgentScopedKernelKeys:
+    """Kernel statistics and commit statuses are stored under the hosting agent's ID."""
+
+    @pytest.fixture
+    async def valkey_stat(
+        self, redis_container: tuple[str, HostPortPairModel]
+    ) -> AsyncIterator[ValkeyStatClient]:
+        hostport_pair: HostPortPairModel = redis_container[1]
+        client = await ValkeyStatClient.create(
+            ValkeyTarget(addr=hostport_pair.address),
+            human_readable_name="test.stat.kernel",
+            db_id=REDIS_STATISTICS_DB,
+        )
+        try:
+            yield client
+        finally:
+            await client.close()
+
+    @pytest.fixture
+    def kernel_id(self) -> str:
+        return str(uuid.uuid4())
+
+    async def test_kernel_statistics_key_is_agent_scoped(
+        self, valkey_stat: ValkeyStatClient, kernel_id: str
+    ) -> None:
+        stat = {"cpu_util": {"current": "12.5", "pct": "12.50"}}
+        await valkey_stat.set_kernel_statistics_batch("agent-a", {kernel_id: msgpack.packb(stat)})
+
+        raw = await valkey_stat._get_raw(f"kstat.agent-a.{kernel_id}")
+        assert raw is not None
+        assert await valkey_stat._get_raw(kernel_id) is None
+        assert await valkey_stat.get_kernel_statistics("agent-a", kernel_id) == stat
+        assert await valkey_stat.get_user_kernel_statistics_batch([("agent-a", kernel_id)]) == [
+            stat
+        ]
+
+    async def test_other_agents_kernel_statistics_are_never_read(
+        self, valkey_stat: ValkeyStatClient, kernel_id: str
+    ) -> None:
+        # A value planted under another agent's ID for the same kernel is ignored.
+        planted = {"cpu_util": {"current": "99", "pct": "99.00"}}
+        await valkey_stat.set_kernel_statistics_batch(
+            "agent-b", {kernel_id: msgpack.packb(planted)}
+        )
+
+        assert await valkey_stat.get_kernel_statistics("agent-a", kernel_id) is None
+        assert await valkey_stat.get_user_kernel_statistics_batch([("agent-a", kernel_id)]) == [
+            None
+        ]
+
+    async def test_kernel_without_agent_has_no_statistics(
+        self, valkey_stat: ValkeyStatClient, kernel_id: str
+    ) -> None:
+        assert await valkey_stat.get_user_kernel_statistics_batch([(None, kernel_id)]) == [None]
+        assert await valkey_stat.get_user_kernel_statistics_batch([]) == []
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            b"\xc1",  # never used in msgpack
+            b"\x93\x01\x02",  # truncated array
+            msgpack.packb([1, 2, 3]),  # not a mapping
+            msgpack.packb("text"),
+        ],
+        ids=["invalid", "truncated", "list", "str"],
+    )
+    async def test_malformed_kernel_statistics_read_as_none(
+        self, valkey_stat: ValkeyStatClient, kernel_id: str, raw: bytes
+    ) -> None:
+        good_kernel_id = str(uuid.uuid4())
+        good = {"mem": {"current": "1024"}}
+        await valkey_stat.set_kernel_statistics_batch(
+            "agent-a", {kernel_id: raw, good_kernel_id: msgpack.packb(good)}
+        )
+
+        assert await valkey_stat.get_kernel_statistics("agent-a", kernel_id) is None
+        assert await valkey_stat.get_user_kernel_statistics_batch([
+            ("agent-a", kernel_id),
+            (None, str(uuid.uuid4())),
+            ("agent-a", good_kernel_id),
+        ]) == [None, None, good]
+
+    async def test_kernel_statistics_decode_no_extension_types(
+        self, valkey_stat: ValkeyStatClient, kernel_id: str
+    ) -> None:
+        # Extension types are left undecoded instead of being deserialized.
+        await valkey_stat.set_kernel_statistics_batch(
+            "agent-a", {kernel_id: msgpack.packb({"cpu_util": {"current": Decimal("1.5")}})}
+        )
+
+        [stat] = await valkey_stat.get_user_kernel_statistics_batch([("agent-a", kernel_id)])
+
+        assert stat is not None
+        assert isinstance(stat["cpu_util"]["current"], plain_msgpack.ExtType)
+
+    async def test_delete_kernel_statistics(
+        self, valkey_stat: ValkeyStatClient, kernel_id: str
+    ) -> None:
+        await valkey_stat.set_kernel_statistics_batch("agent-a", {kernel_id: msgpack.packb({})})
+
+        assert await valkey_stat.delete_kernel_statistics([(None, kernel_id)]) == 0
+        assert await valkey_stat.delete_kernel_statistics([("agent-a", kernel_id)]) == 1
+        assert await valkey_stat._get_raw(f"kstat.agent-a.{kernel_id}") is None
+
+    async def test_kernel_commit_status_key_is_agent_scoped(
+        self, valkey_stat: ValkeyStatClient, kernel_id: str
+    ) -> None:
+        await valkey_stat.update_kernel_commit_statuses("agent-a", [kernel_id], 60)
+
+        assert await valkey_stat._get_raw(f"kernel_commit.agent-a.{kernel_id}") == b"ongoing"
+        assert await valkey_stat.get_kernel_commit_statuses([
+            ("agent-a", kernel_id),
+            ("agent-b", kernel_id),
+            (None, kernel_id),
+        ]) == [b"ongoing", None, None]

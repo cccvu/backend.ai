@@ -25,14 +25,16 @@ class OrphanKernelCleanupObserver(AbstractObserver):
 
     Orphan kernels are containers that exist in Agent but have been
     terminated from Manager's DB. Detection is based on comparing
-    kernel.last_check with agent_last_check timestamps.
+    kernel.last_check with agent_last_check timestamps, both written
+    only by the Manager.
 
     Cleanup condition (strict):
         (agent_last_check exists) AND
-        (kernel status exists in Redis) AND
+        (kernel last_check exists in Redis) AND
         (kernel.last_check < agent_last_check - THRESHOLD)
 
-    All other cases (no Redis entry, no agent_last_check, etc.) are skipped.
+    All other cases (no Redis entry, no agent_last_check, malformed values,
+    etc.) are skipped.
     """
 
     def __init__(
@@ -64,20 +66,18 @@ class OrphanKernelCleanupObserver(AbstractObserver):
         if not kernel_registry:
             return
 
-        # 3. Get kernel presence statuses (read-only)
+        # 3. Get the manager's last check timestamps of this agent's kernels (read-only)
         kernel_ids = list(kernel_registry.keys())
-        statuses = await self._valkey_schedule_client.get_kernel_presence_batch(kernel_ids)
+        last_checks = await self._valkey_schedule_client.get_kernel_last_check_batch(
+            self._agent.id, kernel_ids
+        )
 
         # 4. Find orphan kernels
         orphan_kernels: list[tuple[KernelId, SessionId]] = []
         for kernel_id, kernel in kernel_registry.items():
-            status = statuses.get(kernel_id)
-            if status is None:
-                # No Redis entry - skip (not enough info to decide)
-                continue
-
-            # Skip if last_check is None (not enough info to decide)
-            if status.last_check is None:
+            last_check = last_checks.get(kernel_id)
+            # Skip if last_check is missing or malformed (not enough info to decide)
+            if last_check is None:
                 log.debug(
                     "Kernel {} has no last_check timestamp, skipping orphan check",
                     kernel_id,
@@ -85,12 +85,12 @@ class OrphanKernelCleanupObserver(AbstractObserver):
                 continue
 
             # Strict condition: kernel.last_check < agent_last_check - THRESHOLD
-            if status.last_check < agent_last_check - ORPHAN_KERNEL_THRESHOLD_SEC:
+            if last_check < agent_last_check - ORPHAN_KERNEL_THRESHOLD_SEC:
                 orphan_kernels.append((kernel_id, kernel.session_id))
                 log.info(
                     "Detected orphan kernel: {} (last_check={}, agent_last_check={}, threshold={})",
                     kernel_id,
-                    status.last_check,
+                    last_check,
                     agent_last_check,
                     ORPHAN_KERNEL_THRESHOLD_SEC,
                 )

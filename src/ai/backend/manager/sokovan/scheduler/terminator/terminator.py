@@ -220,21 +220,22 @@ class SessionTerminator:
         if not kernels:
             return []
 
-        # 1. Extract kernel IDs and agent IDs
+        # 1. Extract kernel IDs and the agents hosting them, from the database records
         kernel_ids: list[KernelId] = []
-        agent_ids: set[AgentId] = set()
+        kernel_agents: dict[KernelId, AgentId] = {}
         for kernel_info in kernels:
-            kernel_ids.append(KernelId(kernel_info.id))
+            kernel_id = KernelId(kernel_info.id)
+            kernel_ids.append(kernel_id)
             if kernel_info.resource.agent:
-                agent_ids.add(AgentId(kernel_info.resource.agent))
+                kernel_agents[kernel_id] = AgentId(kernel_info.resource.agent)
 
         if not kernel_ids:
             return []
 
-        # 2. Check presence status in Valkey
+        # 2. Check presence status in Valkey (kernels without an agent have no presence)
         statuses = await self._valkey_schedule.check_kernel_presence_status_batch(
-            kernel_ids,
-            agent_ids=agent_ids,
+            kernel_agents,
+            agent_ids=set(kernel_agents.values()),
         )
 
         # 3. Filter STALE kernels (None status or STALE presence)

@@ -79,7 +79,7 @@ from .types import DistributedLockFactory
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncConnection as SAConnection
 
-    from ai.backend.common.types import KernelId, SessionId
+    from ai.backend.common.types import AgentId, KernelId, SessionId
 
     from .models.utils import ExtendedAsyncSAEngine as SAEngine
 
@@ -264,6 +264,7 @@ class IdleCheckerHost:
             query = (
                 sa.select(
                     kernels.c.id,
+                    kernels.c.agent,
                     kernels.c.access_key,
                     kernels.c.session_id,
                     kernels.c.session_type,
@@ -970,14 +971,14 @@ class UtilizationIdleChecker(BaseIdleChecker):
 
         # Get current utilization data from all containers of the session.
         if kernel.cluster_size > 1:
-            query = sa.select(kernels.c.id).where(
+            query = sa.select(kernels.c.id, kernels.c.agent).where(
                 (kernels.c.session_id == session_id) & (kernels.c.status.in_(LIVE_STATUS)),
             )
             rows = (await dbconn.execute(query)).fetchall()
-            kernel_ids = [k.id for k in rows]
+            session_kernels = [(k.id, k.agent) for k in rows]
         else:
-            kernel_ids = [kernel.id]
-        current_utilizations = await self.get_current_utilization(kernel_ids, occupied_slots)
+            session_kernels = [(kernel.id, kernel.agent)]
+        current_utilizations = await self.get_current_utilization(session_kernels, occupied_slots)
         if current_utilizations is None:
             return True
 
@@ -1073,13 +1074,15 @@ class UtilizationIdleChecker(BaseIdleChecker):
 
     async def get_current_utilization(
         self,
-        kernel_ids: Sequence[KernelId],
+        kernels: Sequence[tuple[KernelId, AgentId | None]],
         occupied_slots: Mapping[str, Any],
     ) -> Mapping[str, float | None] | None:
         """
         Return the current utilization key-value pairs of multiple kernels, possibly the
-        components of a cluster session. If there are multiple kernel_ids, this method
+        components of a cluster session. If there are multiple kernels, this method
         will return the averaged values over the kernels for each utilization.
+
+        Each kernel is given with the ID of the agent hosting it, from the database.
 
         When a metric is missing from some kernels' stats (e.g., CUDA plugin failure),
         the metric is averaged only over the kernels that reported it. If no kernel
@@ -1091,8 +1094,14 @@ class UtilizationIdleChecker(BaseIdleChecker):
             utilization_counts: defaultdict[str, int] = defaultdict(int)
             live_stat = {}
             kernel_counter = 0
-            for kernel_id in kernel_ids:
-                raw_live_stat = await self._valkey_stat_client.get_kernel_statistics(str(kernel_id))
+            for kernel_id, agent_id in kernels:
+                raw_live_stat = (
+                    await self._valkey_stat_client.get_kernel_statistics(
+                        str(agent_id), str(kernel_id)
+                    )
+                    if agent_id
+                    else None
+                )
                 if raw_live_stat is None:
                     log.warning(
                         "Utilization data not found or failed to fetch utilization data. Skip idle check (k:{})",
@@ -1131,7 +1140,7 @@ class UtilizationIdleChecker(BaseIdleChecker):
                     result[resource] = None
             return result
         except Exception as e:
-            _msg = f"Unable to collect utilization for idleness check (kernels:{kernel_ids})"
+            _msg = f"Unable to collect utilization for idleness check (kernels:{[k for k, _ in kernels]})"
             log.warning(_msg, exc_info=e)
             return None
 

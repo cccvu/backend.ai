@@ -796,6 +796,7 @@ class UserDBSource:
             query = (
                 sa.select(
                     kernels.c.id,
+                    kernels.c.agent,
                     kernels.c.created_at,
                     kernels.c.terminated_at,
                     kernels.c.occupied_slots,

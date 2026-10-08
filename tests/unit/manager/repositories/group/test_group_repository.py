@@ -5,7 +5,8 @@ from __future__ import annotations
 import json
 import uuid
 from collections.abc import AsyncGenerator
-from unittest.mock import MagicMock
+from datetime import UTC, datetime, timedelta
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import sqlalchemy as sa
@@ -81,6 +82,7 @@ from ai.backend.manager.models.virtual_scope.virtual_scope import VirtualScopeRo
 from ai.backend.manager.repositories.base.creator import Creator
 from ai.backend.manager.repositories.base.updater import Updater
 from ai.backend.manager.repositories.group.creators import GroupCreatorSpec
+from ai.backend.manager.repositories.group.db_source import GroupDBSource
 from ai.backend.manager.repositories.group.repository import GroupRepository
 from ai.backend.manager.repositories.group.updaters import GroupUpdaterSpec
 from ai.backend.manager.types import OptionalState, TriState
@@ -1242,6 +1244,45 @@ class TestGroupRepository:
         async with db_with_cleanup.begin_session() as session:
             group_row = await session.scalar(sa.select(GroupRow).where(GroupRow.id == test_group))
             assert group_row is None
+
+    async def test_container_stats_keep_kernel_without_stats(
+        self,
+        db_with_cleanup: ExtendedAsyncSAEngine,
+        group_with_active_kernel: uuid.UUID,
+    ) -> None:
+        """The period report keeps a kernel that has no statistics and reads the
+        statistics under the agent recorded for the kernel."""
+        async with db_with_cleanup.begin_readonly() as conn:
+            kernel = (
+                await conn.execute(
+                    sa.select(KernelRow.id, KernelRow.agent).where(
+                        KernelRow.group_id == group_with_active_kernel
+                    )
+                )
+            ).one()
+        valkey_stat = AsyncMock()
+        valkey_stat.get_user_kernel_statistics_batch.return_value = [None]
+        config_provider = MagicMock()
+        config_provider.config.system.timezone = UTC
+        now = datetime.now(UTC)
+
+        result = await GroupDBSource(db=db_with_cleanup).get_container_stats_for_period(
+            now - timedelta(days=1),
+            now + timedelta(days=1),
+            valkey_stat,
+            config_provider,
+            [group_with_active_kernel],
+        )
+
+        valkey_stat.get_user_kernel_statistics_batch.assert_awaited_once_with([
+            (kernel.agent, str(kernel.id))
+        ])
+        assert len(result) == 1
+        [c_info] = result[0]["c_infos"]
+        assert c_info["id"] == str(kernel.id)
+        assert c_info["agent"] == kernel.agent
+        assert c_info["cpu_used"] == 0.0
+        assert c_info["io_read"] == 0
 
     async def test_purge_group_with_active_kernels(
         self,

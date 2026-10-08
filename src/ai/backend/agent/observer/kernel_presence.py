@@ -50,7 +50,9 @@ class KernelPresenceObserver(AbstractObserver):
         }
 
         if kernel_presences:
-            await self._valkey_schedule_client.update_kernel_presence_batch(kernel_presences)
+            await self._valkey_schedule_client.update_kernel_presence_batch(
+                self._agent.id, kernel_presences
+            )
 
     @override
     def observe_interval(self) -> float:

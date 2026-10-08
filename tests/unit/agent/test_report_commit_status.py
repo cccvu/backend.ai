@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, Mock, patch
 import pytest
 
 from ai.backend.agent.agent import COMMIT_STATUS_EXPIRE, AbstractAgent
+from ai.backend.common.types import AgentId
 
 
 @dataclass
@@ -37,6 +38,7 @@ class TestReportAllKernelCommitStatusMap:
         agent.local_config.agent = Mock()
         agent.local_config.agent.image_commit_path = tmp_path / "commit"
         agent.local_config.agent.image_commit_path.mkdir(parents=True)
+        agent.id = AgentId("test-agent")
         agent.valkey_stat_client = AsyncMock()
         agent.valkey_stat_client.update_kernel_commit_statuses = AsyncMock()
         return agent
@@ -85,8 +87,10 @@ class TestReportAllKernelCommitStatusMap:
         # Then: Verify update_kernel_commit_statuses called with expected kernel IDs and expire time
         mock_agent.valkey_stat_client.update_kernel_commit_statuses.assert_called_once()
         call_args = mock_agent.valkey_stat_client.update_kernel_commit_statuses.call_args
-        kernel_ids = set(call_args[0][0])
-        expire_sec = call_args[0][1]
+        agent_id = call_args[0][0]
+        kernel_ids = set(call_args[0][1])
+        expire_sec = call_args[0][2]
+        assert agent_id == mock_agent.id
         assert kernel_ids == scenario.expected_kernel_ids
         assert expire_sec == COMMIT_STATUS_EXPIRE
 
@@ -102,7 +106,7 @@ class TestReportAllKernelCommitStatusMap:
 
         # Then: Verify update_kernel_commit_statuses called with empty list
         call_args = mock_agent.valkey_stat_client.update_kernel_commit_statuses.call_args
-        kernel_ids = call_args[0][0]
+        kernel_ids = call_args[0][1]
         assert kernel_ids == []
 
     async def test_oserror_during_scan_is_caught_and_logged(

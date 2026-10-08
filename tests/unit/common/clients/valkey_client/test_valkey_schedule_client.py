@@ -5,7 +5,6 @@ Tests the client with real Redis operations for route health monitoring.
 
 from __future__ import annotations
 
-import asyncio
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 from time import time
@@ -17,6 +16,7 @@ from glide import ExpirySet, ExpiryType
 from ai.backend.common.clients.valkey_client.valkey_schedule.client import (
     AGENT_LAST_CHECK_TTL_SEC,
     KERNEL_HEALTH_TTL_SEC,
+    KERNEL_LAST_CHECK_TTL_SEC,
     MAX_HEALTH_STALENESS_SEC,
     MAX_KERNEL_HEALTH_STALENESS_SEC,
     HealthCheckStatus,
@@ -314,12 +314,63 @@ class KernelPresenceFixture:
     """Container for kernel presence test fixtures."""
 
     client: ValkeyScheduleClient
-    kernel_id: KernelId
+    agent_id: AgentId
     kernel_ids: list[KernelId]
     healthy_kernel_id: KernelId
     unhealthy_kernel_id: KernelId
     stale_kernel_id: KernelId
     missing_kernel_id: KernelId
+
+
+class TestKernelPresenceParsing:
+    """Parsing of presence values never raises; malformed values give None."""
+
+    @pytest.mark.parametrize(
+        "fields",
+        [
+            None,
+            Exception("WRONGTYPE"),
+            [b"1", b"1000"],
+            [None, None, None],
+            [b"1", None, None],
+            [b"1", b"not-a-number", None],
+            [b"\xff", b"1000", None],
+            [b"1", b"\xff", None],
+        ],
+        ids=[
+            "missing",
+            "error",
+            "short",
+            "absent",
+            "no-timestamp",
+            "bad-timestamp",
+            "bad-presence",
+            "bad-timestamp-bytes",
+        ],
+    )
+    def test_malformed_presence_is_none(self, fields: object) -> None:
+        assert (
+            ValkeyScheduleClient._parse_kernel_presence(fields, last_check=1000, current_time=1000)
+            is None
+        )
+
+    def test_malformed_created_at_is_ignored(self) -> None:
+        status = ValkeyScheduleClient._parse_kernel_presence(
+            [b"1", b"1000", b"x"], last_check=1000, current_time=1000
+        )
+        assert status is not None
+        assert status.presence == HealthCheckStatus.HEALTHY
+        assert status.created_at == 0
+
+    @pytest.mark.parametrize(
+        "value",
+        [None, b"", b"abc", b"\xff", b"1.5", Exception("error")],
+    )
+    def test_malformed_timestamp_is_none(self, value: object) -> None:
+        assert ValkeyScheduleClient._parse_timestamp(value) is None
+
+    def test_timestamp(self) -> None:
+        assert ValkeyScheduleClient._parse_timestamp(b"1234") == 1234
 
 
 class TestKernelPresenceStatus:
@@ -349,9 +400,14 @@ class TestKernelPresenceStatus:
             await client.close()
 
     @pytest.fixture
-    def kernel_id(self) -> KernelId:
-        """Generate a single kernel ID."""
-        return KernelId(uuid4())
+    def agent_id(self) -> AgentId:
+        """Generate a unique agent ID."""
+        return AgentId(f"agent-{uuid4().hex[:8]}")
+
+    @pytest.fixture
+    def other_agent_id(self) -> AgentId:
+        """Generate another unique agent ID."""
+        return AgentId(f"agent-{uuid4().hex[:8]}")
 
     @pytest.fixture
     def kernel_ids(self) -> list[KernelId]:
@@ -359,66 +415,52 @@ class TestKernelPresenceStatus:
         return [KernelId(uuid4()) for _ in range(3)]
 
     @pytest.fixture
-    async def initialized_kernel(
-        self,
-        valkey_schedule_client: ValkeyScheduleClient,
-        kernel_id: KernelId,
-    ) -> KernelId:
-        """Initialize a kernel and return its ID."""
-        await valkey_schedule_client.initialize_kernel_presence_batch([kernel_id])
-        return kernel_id
-
-    @pytest.fixture
     async def initialized_kernels(
         self,
         valkey_schedule_client: ValkeyScheduleClient,
+        agent_id: AgentId,
         kernel_ids: list[KernelId],
     ) -> list[KernelId]:
         """Initialize multiple kernels and return their IDs."""
-        await valkey_schedule_client.initialize_kernel_presence_batch(kernel_ids)
+        await valkey_schedule_client.initialize_kernel_presence_batch(
+            dict.fromkeys(kernel_ids, agent_id)
+        )
         return kernel_ids
 
     @pytest.fixture
     async def healthy_kernel(
         self,
         valkey_schedule_client: ValkeyScheduleClient,
+        agent_id: AgentId,
     ) -> KernelId:
         """Create a kernel with healthy presence status."""
         kernel_id = KernelId(uuid4())
-        await valkey_schedule_client.initialize_kernel_presence_batch([kernel_id])
-        await valkey_schedule_client.update_kernel_presence_batch({kernel_id: True})
+        await valkey_schedule_client.update_kernel_presence_batch(agent_id, {kernel_id: True})
         return kernel_id
 
     @pytest.fixture
     async def unhealthy_kernel(
         self,
         valkey_schedule_client: ValkeyScheduleClient,
+        agent_id: AgentId,
     ) -> KernelId:
         """Create a kernel with unhealthy presence status."""
         kernel_id = KernelId(uuid4())
-        await valkey_schedule_client.initialize_kernel_presence_batch([kernel_id])
-        await valkey_schedule_client.update_kernel_presence_batch({kernel_id: False})
+        await valkey_schedule_client.update_kernel_presence_batch(agent_id, {kernel_id: False})
         return kernel_id
 
     @pytest.fixture
     async def stale_kernel(
         self,
         valkey_schedule_client: ValkeyScheduleClient,
+        agent_id: AgentId,
     ) -> KernelId:
         """Create a kernel with stale presence status."""
         kernel_id = KernelId(uuid4())
-        key = valkey_schedule_client._get_kernel_presence_key(kernel_id)
+        key = valkey_schedule_client._get_kernel_presence_key(agent_id, kernel_id)
         stale_timestamp = str(int(time()) - MAX_KERNEL_HEALTH_STALENESS_SEC - 10)
         async with valkey_schedule_client._client.client() as conn:
-            await conn.hset(
-                key,
-                {
-                    "presence": "1",
-                    "last_presence": stale_timestamp,
-                    "last_check": stale_timestamp,
-                    "created_at": stale_timestamp,
-                },
-            )
+            await conn.hset(key, {"presence": "1", "last_presence": stale_timestamp})
             await conn.expire(key, KERNEL_HEALTH_TTL_SEC)
         return kernel_id
 
@@ -426,6 +468,7 @@ class TestKernelPresenceStatus:
     async def mixed_state_kernels(
         self,
         valkey_schedule_client: ValkeyScheduleClient,
+        agent_id: AgentId,
         healthy_kernel: KernelId,
         unhealthy_kernel: KernelId,
         stale_kernel: KernelId,
@@ -434,7 +477,7 @@ class TestKernelPresenceStatus:
         missing_kernel_id = KernelId(uuid4())  # Not initialized
         return KernelPresenceFixture(
             client=valkey_schedule_client,
-            kernel_id=healthy_kernel,
+            agent_id=agent_id,
             kernel_ids=[healthy_kernel, unhealthy_kernel, stale_kernel, missing_kernel_id],
             healthy_kernel_id=healthy_kernel,
             unhealthy_kernel_id=unhealthy_kernel,
@@ -447,11 +490,12 @@ class TestKernelPresenceStatus:
     async def test_initialize_kernel_presence_batch(
         self,
         valkey_schedule_client: ValkeyScheduleClient,
+        agent_id: AgentId,
         initialized_kernels: list[KernelId],
     ) -> None:
         """Test batch initialization of kernel presence status."""
         statuses = await valkey_schedule_client.check_kernel_presence_status_batch(
-            initialized_kernels
+            dict.fromkeys(initialized_kernels, agent_id)
         )
 
         assert len(statuses) == len(initialized_kernels)
@@ -467,15 +511,47 @@ class TestKernelPresenceStatus:
         self, valkey_schedule_client: ValkeyScheduleClient
     ) -> None:
         """Test that empty batch initialization does nothing."""
-        await valkey_schedule_client.initialize_kernel_presence_batch([])
+        await valkey_schedule_client.initialize_kernel_presence_batch({})
+
+    async def test_presence_key_is_agent_scoped(
+        self,
+        valkey_schedule_client: ValkeyScheduleClient,
+        agent_id: AgentId,
+        healthy_kernel: KernelId,
+    ) -> None:
+        """The agent writes its presence under its own ID only."""
+        async with valkey_schedule_client._client.client() as conn:
+            scoped = await conn.hgetall(f"kernel:presence:{agent_id}:{healthy_kernel}")
+            unscoped = await conn.exists([f"kernel:presence:{healthy_kernel}"])
+        assert set(scoped.keys()) == {b"presence", b"last_presence"}
+        assert unscoped == 0
+
+    async def test_other_agents_presence_is_never_read(
+        self,
+        valkey_schedule_client: ValkeyScheduleClient,
+        agent_id: AgentId,
+        other_agent_id: AgentId,
+    ) -> None:
+        """A presence reported under another agent's ID does not count for the kernel."""
+        kernel_id = KernelId(uuid4())
+        await valkey_schedule_client.update_kernel_presence_batch(other_agent_id, {kernel_id: True})
+
+        statuses = await valkey_schedule_client.check_kernel_presence_status_batch({
+            kernel_id: agent_id
+        })
+
+        assert statuses[kernel_id] is None
 
     async def test_update_kernel_presence_batch_healthy(
         self,
         valkey_schedule_client: ValkeyScheduleClient,
+        agent_id: AgentId,
         healthy_kernel: KernelId,
     ) -> None:
         """Test batch update of kernel presence to healthy."""
-        statuses = await valkey_schedule_client.check_kernel_presence_status_batch([healthy_kernel])
+        statuses = await valkey_schedule_client.check_kernel_presence_status_batch({
+            healthy_kernel: agent_id
+        })
 
         status = statuses[healthy_kernel]
         assert status is not None
@@ -484,119 +560,107 @@ class TestKernelPresenceStatus:
     async def test_update_kernel_presence_batch_unhealthy(
         self,
         valkey_schedule_client: ValkeyScheduleClient,
+        agent_id: AgentId,
         unhealthy_kernel: KernelId,
     ) -> None:
         """Test batch update of kernel presence to unhealthy."""
-        statuses = await valkey_schedule_client.check_kernel_presence_status_batch([
-            unhealthy_kernel
-        ])
+        statuses = await valkey_schedule_client.check_kernel_presence_status_batch({
+            unhealthy_kernel: agent_id
+        })
 
         status = statuses[unhealthy_kernel]
         assert status is not None
         assert status.presence == HealthCheckStatus.UNHEALTHY
 
-    async def test_update_kernel_presence_batch_mixed(
-        self,
-        valkey_schedule_client: ValkeyScheduleClient,
-        healthy_kernel: KernelId,
-        unhealthy_kernel: KernelId,
-    ) -> None:
-        """Test batch update with mixed healthy/unhealthy states."""
-        statuses = await valkey_schedule_client.check_kernel_presence_status_batch([
-            healthy_kernel,
-            unhealthy_kernel,
-        ])
-
-        healthy_status = statuses[healthy_kernel]
-        assert healthy_status is not None
-        assert healthy_status.presence == HealthCheckStatus.HEALTHY
-
-        unhealthy_status = statuses[unhealthy_kernel]
-        assert unhealthy_status is not None
-        assert unhealthy_status.presence == HealthCheckStatus.UNHEALTHY
-
     async def test_delete_kernel_presence_batch(
         self,
         valkey_schedule_client: ValkeyScheduleClient,
+        agent_id: AgentId,
         initialized_kernels: list[KernelId],
     ) -> None:
-        """Test batch deletion of kernel presence status."""
-        # Verify exists before delete
-        statuses_before = await valkey_schedule_client.check_kernel_presence_status_batch(
-            initialized_kernels
-        )
-        for kernel_id in initialized_kernels:
-            assert statuses_before[kernel_id] is not None
+        """Test batch deletion of kernel presence status and check timestamps."""
+        kernel_agents = dict.fromkeys(initialized_kernels, agent_id)
 
-        # Delete
-        await valkey_schedule_client.delete_kernel_presence_batch(initialized_kernels)
+        await valkey_schedule_client.delete_kernel_presence_batch(kernel_agents)
 
-        # Verify deleted
-        statuses_after = await valkey_schedule_client.check_kernel_presence_status_batch(
-            initialized_kernels
+        last_checks = await valkey_schedule_client.get_kernel_last_check_batch(
+            agent_id, initialized_kernels
         )
+        statuses = await valkey_schedule_client.check_kernel_presence_status_batch(kernel_agents)
         for kernel_id in initialized_kernels:
-            assert statuses_after[kernel_id] is None
+            assert last_checks[kernel_id] is None
+            assert statuses[kernel_id] is None
 
     async def test_delete_kernel_presence_batch_empty(
         self, valkey_schedule_client: ValkeyScheduleClient
     ) -> None:
         """Test that empty batch deletion does nothing."""
-        await valkey_schedule_client.delete_kernel_presence_batch([])
+        await valkey_schedule_client.delete_kernel_presence_batch({})
 
     async def test_check_kernel_presence_status_batch_not_found(
         self,
         valkey_schedule_client: ValkeyScheduleClient,
+        agent_id: AgentId,
         kernel_ids: list[KernelId],
     ) -> None:
         """Test checking status for non-existent kernels."""
-        statuses = await valkey_schedule_client.check_kernel_presence_status_batch(kernel_ids)
+        statuses = await valkey_schedule_client.check_kernel_presence_status_batch(
+            dict.fromkeys(kernel_ids, agent_id)
+        )
 
         assert len(statuses) == len(kernel_ids)
         for kernel_id in kernel_ids:
             assert statuses[kernel_id] is None
+        # Checking a kernel never creates its presence hash.
+        async with valkey_schedule_client._client.client() as conn:
+            exists = await conn.exists([
+                valkey_schedule_client._get_kernel_presence_key(agent_id, kernel_id)
+                for kernel_id in kernel_ids
+            ])
+        assert exists == 0
 
     async def test_check_kernel_presence_status_batch_empty(
         self, valkey_schedule_client: ValkeyScheduleClient
     ) -> None:
-        """Test checking status with empty list."""
-        statuses = await valkey_schedule_client.check_kernel_presence_status_batch([])
+        """Test checking status with empty input."""
+        statuses = await valkey_schedule_client.check_kernel_presence_status_batch({})
         assert statuses == {}
 
-    async def test_check_kernel_presence_status_batch_updates_last_check(
+    async def test_check_writes_manager_only_last_check_key(
         self,
         valkey_schedule_client: ValkeyScheduleClient,
+        agent_id: AgentId,
+        healthy_kernel: KernelId,
     ) -> None:
-        """Test that check updates last_check timestamp."""
-        # Set kernel with old last_check timestamp
-        kernel_id = KernelId(uuid4())
-        key = valkey_schedule_client._get_kernel_presence_key(kernel_id)
-        old_timestamp = str(int(time()) - 60)  # 60 seconds ago
-        async with valkey_schedule_client._client.client() as conn:
-            await conn.hset(
-                key,
-                {
-                    "presence": "1",
-                    "last_presence": old_timestamp,
-                    "last_check": old_timestamp,
-                    "created_at": old_timestamp,
-                },
-            )
-
-        # Check should update last_check
-        statuses = await valkey_schedule_client.check_kernel_presence_status_batch([kernel_id])
-        status = statuses[kernel_id]
+        """The check time goes to its own key with a TTL, not into the agent's hash."""
+        statuses = await valkey_schedule_client.check_kernel_presence_status_batch({
+            healthy_kernel: agent_id
+        })
+        status = statuses[healthy_kernel]
         assert status is not None
-        assert status.last_check is not None
-        assert status.last_check > int(old_timestamp)
+
+        key = f"kernel:last_check:{agent_id}:{healthy_kernel}"
+        async with valkey_schedule_client._client.client() as conn:
+            value = await conn.get(key)
+            ttl = await conn.ttl(key)
+            hash_last_check = await conn.hget(
+                valkey_schedule_client._get_kernel_presence_key(agent_id, healthy_kernel),
+                "last_check",
+            )
+        assert value is not None and int(value) == status.last_check
+        assert 0 < ttl <= KERNEL_LAST_CHECK_TTL_SEC
+        assert hash_last_check is None
 
     async def test_check_kernel_presence_status_batch_stale_detection(
         self,
         valkey_schedule_client: ValkeyScheduleClient,
+        agent_id: AgentId,
         stale_kernel: KernelId,
     ) -> None:
         """Test that stale kernel presence is detected correctly."""
-        statuses = await valkey_schedule_client.check_kernel_presence_status_batch([stale_kernel])
+        statuses = await valkey_schedule_client.check_kernel_presence_status_batch({
+            stale_kernel: agent_id
+        })
 
         status = statuses[stale_kernel]
         assert status is not None
@@ -608,7 +672,9 @@ class TestKernelPresenceStatus:
     ) -> None:
         """Test checking multiple kernels with different states."""
         fixture = mixed_state_kernels
-        statuses = await fixture.client.check_kernel_presence_status_batch(fixture.kernel_ids)
+        statuses = await fixture.client.check_kernel_presence_status_batch(
+            dict.fromkeys(fixture.kernel_ids, fixture.agent_id)
+        )
 
         assert len(statuses) == len(fixture.kernel_ids)
 
@@ -625,6 +691,47 @@ class TestKernelPresenceStatus:
         assert stale_status.presence == HealthCheckStatus.STALE
 
         assert statuses[fixture.missing_kernel_id] is None
+
+    @pytest.mark.parametrize(
+        "fields",
+        [
+            {"presence": "1", "last_presence": "not-a-number"},
+            {"presence": b"\xff", "last_presence": "0"},
+            {"presence": "1", "last_presence": b"\xff\xfe"},
+            {"last_presence": "0"},
+        ],
+        ids=["bad-timestamp", "bad-presence", "bad-bytes", "no-presence"],
+    )
+    async def test_malformed_presence_does_not_break_the_batch(
+        self,
+        valkey_schedule_client: ValkeyScheduleClient,
+        agent_id: AgentId,
+        healthy_kernel: KernelId,
+        fields: dict[str | bytes, str | bytes],
+    ) -> None:
+        """A malformed hash reads as None and the other kernels are still parsed."""
+        bad_kernel = KernelId(uuid4())
+        wrong_type_kernel = KernelId(uuid4())
+        async with valkey_schedule_client._client.client() as conn:
+            await conn.hset(
+                valkey_schedule_client._get_kernel_presence_key(agent_id, bad_kernel), fields
+            )
+            await conn.set(
+                valkey_schedule_client._get_kernel_presence_key(agent_id, wrong_type_kernel),
+                "not-a-hash",
+            )
+
+        statuses = await valkey_schedule_client.check_kernel_presence_status_batch({
+            bad_kernel: agent_id,
+            wrong_type_kernel: agent_id,
+            healthy_kernel: agent_id,
+        })
+
+        assert statuses[bad_kernel] is None
+        assert statuses[wrong_type_kernel] is None
+        healthy_status = statuses[healthy_kernel]
+        assert healthy_status is not None
+        assert healthy_status.presence == HealthCheckStatus.HEALTHY
 
 
 class TestAgentLastCheck:
@@ -700,6 +807,19 @@ class TestAgentLastCheck:
         result = await valkey_schedule_client.get_agent_last_check(agent_id)
         assert result == expected_timestamp
 
+    @pytest.mark.parametrize("value", ["abc", "1.5", b"\xff"], ids=["text", "float", "bytes"])
+    async def test_get_agent_last_check_malformed(
+        self,
+        valkey_schedule_client: ValkeyScheduleClient,
+        agent_id: AgentId,
+        value: str | bytes,
+    ) -> None:
+        """A non-integer agent last check reads as None."""
+        async with valkey_schedule_client._client.client() as conn:
+            await conn.set(valkey_schedule_client._get_agent_last_check_key(agent_id), value)
+
+        assert await valkey_schedule_client.get_agent_last_check(agent_id) is None
+
     async def test_check_kernel_presence_updates_agent_last_check(
         self,
         valkey_schedule_client: ValkeyScheduleClient,
@@ -707,18 +827,16 @@ class TestAgentLastCheck:
         kernel_ids: list[KernelId],
     ) -> None:
         """Test that check_kernel_presence_status_batch updates agent_last_check."""
-        # Initialize kernels
-        await valkey_schedule_client.initialize_kernel_presence_batch(kernel_ids)
+        kernel_agents = dict.fromkeys(kernel_ids, agent_id)
+        await valkey_schedule_client.initialize_kernel_presence_batch(kernel_agents)
 
         # Verify agent_last_check doesn't exist yet
         assert await valkey_schedule_client.get_agent_last_check(agent_id) is None
 
-        # Call check_kernel_presence_status_batch with agent_ids
         await valkey_schedule_client.check_kernel_presence_status_batch(
-            kernel_ids, agent_ids={agent_id}
+            kernel_agents, agent_ids={agent_id}
         )
 
-        # Verify agent_last_check was set
         result = await valkey_schedule_client.get_agent_last_check(agent_id)
         assert result is not None
         assert result > 0
@@ -730,15 +848,16 @@ class TestAgentLastCheck:
         kernel_ids: list[KernelId],
     ) -> None:
         """Test that check_kernel_presence_status_batch updates multiple agent_last_check."""
-        # Initialize kernels
-        await valkey_schedule_client.initialize_kernel_presence_batch(kernel_ids)
+        agents = sorted(agent_ids)
+        kernel_agents = {
+            kernel_id: agents[i % len(agents)] for i, kernel_id in enumerate(kernel_ids)
+        }
+        await valkey_schedule_client.initialize_kernel_presence_batch(kernel_agents)
 
-        # Call check_kernel_presence_status_batch with multiple agent_ids
         await valkey_schedule_client.check_kernel_presence_status_batch(
-            kernel_ids, agent_ids=agent_ids
+            kernel_agents, agent_ids=agent_ids
         )
 
-        # Verify all agent_last_check values were set
         for agent_id in agent_ids:
             result = await valkey_schedule_client.get_agent_last_check(agent_id)
             assert result is not None
@@ -751,98 +870,93 @@ class TestAgentLastCheck:
         kernel_ids: list[KernelId],
     ) -> None:
         """Test that check_kernel_presence_status_batch without agent_ids doesn't update."""
-        # Initialize kernels
-        await valkey_schedule_client.initialize_kernel_presence_batch(kernel_ids)
+        kernel_agents = dict.fromkeys(kernel_ids, agent_id)
+        await valkey_schedule_client.initialize_kernel_presence_batch(kernel_agents)
 
-        # Call without agent_ids
-        await valkey_schedule_client.check_kernel_presence_status_batch(kernel_ids)
+        await valkey_schedule_client.check_kernel_presence_status_batch(kernel_agents)
 
-        # Verify agent_last_check was not set
         result = await valkey_schedule_client.get_agent_last_check(agent_id)
         assert result is None
 
-    async def test_get_kernel_presence_batch_does_not_update_last_check(
+    async def test_get_kernel_last_check_batch(
         self,
         valkey_schedule_client: ValkeyScheduleClient,
+        agent_id: AgentId,
         kernel_ids: list[KernelId],
     ) -> None:
-        """Test that get_kernel_presence_batch does not update last_check timestamp."""
-        # Initialize kernels
-        await valkey_schedule_client.initialize_kernel_presence_batch(kernel_ids)
-
-        # Get initial last_check values
-        initial_statuses = await valkey_schedule_client.check_kernel_presence_status_batch(
-            kernel_ids
+        """The agent reads the manager's check time of its own kernels."""
+        statuses = await valkey_schedule_client.check_kernel_presence_status_batch(
+            dict.fromkeys(kernel_ids, agent_id)
         )
-        initial_last_checks: dict[KernelId, int] = {}
-        for kid, status in initial_statuses.items():
-            if status and status.last_check is not None:
-                initial_last_checks[kid] = status.last_check
 
-        # Wait a bit
-        await asyncio.sleep(0.1)
+        last_checks = await valkey_schedule_client.get_kernel_last_check_batch(agent_id, kernel_ids)
 
-        # Call get_kernel_presence_batch (read-only)
-        await valkey_schedule_client.get_kernel_presence_batch(kernel_ids)
+        for kernel_id in kernel_ids:
+            status = statuses[kernel_id]
+            assert status is None  # never reported by the agent
+            last_check = last_checks[kernel_id]
+            assert last_check is not None
+            assert last_check > 0
 
-        # Verify last_check values are unchanged
-        current_statuses = await valkey_schedule_client.check_kernel_presence_status_batch(
-            kernel_ids
-        )
-        for kernel_id, status in current_statuses.items():
-            if status and status.last_check is not None:
-                # last_check should be updated by check_kernel_presence_status_batch
-                # but not by get_kernel_presence_batch
-                initial_value = initial_last_checks.get(kernel_id, 0)
-                assert status.last_check >= initial_value
-
-    async def test_get_kernel_presence_batch_returns_status(
+    async def test_other_agents_last_check_is_never_read(
         self,
         valkey_schedule_client: ValkeyScheduleClient,
+        agent_ids: set[AgentId],
+    ) -> None:
+        """A check time recorded under another agent's ID does not count for the kernel."""
+        agent_id, other_agent_id = sorted(agent_ids)
+        kernel_id = KernelId(uuid4())
+        async with valkey_schedule_client._client.client() as conn:
+            await conn.set(
+                valkey_schedule_client._get_kernel_last_check_key(other_agent_id, kernel_id), "0"
+            )
+
+        last_checks = await valkey_schedule_client.get_kernel_last_check_batch(
+            agent_id, [kernel_id]
+        )
+
+        assert last_checks == {kernel_id: None}
+
+    async def test_agent_presence_report_does_not_write_last_check(
+        self,
+        valkey_schedule_client: ValkeyScheduleClient,
+        agent_id: AgentId,
         kernel_ids: list[KernelId],
     ) -> None:
-        """Test that get_kernel_presence_batch returns correct status."""
-        # Initialize and update kernels with healthy status
-        await valkey_schedule_client.initialize_kernel_presence_batch(kernel_ids)
-        await valkey_schedule_client.update_kernel_presence_batch({
-            kernel_ids[0]: True,  # healthy
-            kernel_ids[1]: False,  # unhealthy
-        })
+        """Only the manager's check writes the kernel check time."""
+        await valkey_schedule_client.update_kernel_presence_batch(
+            agent_id, dict.fromkeys(kernel_ids, True)
+        )
 
-        # Get presence batch
-        statuses = await valkey_schedule_client.get_kernel_presence_batch(kernel_ids)
+        last_checks = await valkey_schedule_client.get_kernel_last_check_batch(agent_id, kernel_ids)
 
-        assert len(statuses) == len(kernel_ids)
+        assert last_checks == dict.fromkeys(kernel_ids)
 
-        # Healthy kernel
-        status0 = statuses[kernel_ids[0]]
-        assert status0 is not None
-        assert status0.presence == HealthCheckStatus.HEALTHY
-
-        # Unhealthy kernel
-        status1 = statuses[kernel_ids[1]]
-        assert status1 is not None
-        assert status1.presence == HealthCheckStatus.UNHEALTHY
-
-    async def test_get_kernel_presence_batch_missing_kernel(
+    async def test_get_kernel_last_check_batch_malformed(
         self,
         valkey_schedule_client: ValkeyScheduleClient,
+        agent_id: AgentId,
     ) -> None:
-        """Test that get_kernel_presence_batch returns None for non-existent kernel."""
-        missing_kernel_id = KernelId(uuid4())
+        """A malformed check time reads as None."""
+        kernel_id = KernelId(uuid4())
+        async with valkey_schedule_client._client.client() as conn:
+            await conn.set(
+                valkey_schedule_client._get_kernel_last_check_key(agent_id, kernel_id), "x"
+            )
 
-        statuses = await valkey_schedule_client.get_kernel_presence_batch([missing_kernel_id])
+        last_checks = await valkey_schedule_client.get_kernel_last_check_batch(
+            agent_id, [kernel_id]
+        )
 
-        assert statuses[missing_kernel_id] is None
+        assert last_checks == {kernel_id: None}
 
-    async def test_get_kernel_presence_batch_empty(
+    async def test_get_kernel_last_check_batch_empty(
         self,
         valkey_schedule_client: ValkeyScheduleClient,
+        agent_id: AgentId,
     ) -> None:
-        """Test that get_kernel_presence_batch returns empty dict for empty input."""
-        statuses = await valkey_schedule_client.get_kernel_presence_batch([])
-
-        assert statuses == {}
+        """Test that get_kernel_last_check_batch returns empty dict for empty input."""
+        assert await valkey_schedule_client.get_kernel_last_check_batch(agent_id, []) == {}
 
 
 class TestForceTerminatedCleanupQueue:

@@ -41,6 +41,7 @@ from ai.backend.common.identifier.user import UserID
 from ai.backend.common.identifier.vfolder import VFolderUUID
 from ai.backend.common.types import (
     AccessKey,
+    AgentId,
     KernelId,
     MountPermission,
     SessionId,
@@ -1509,14 +1510,14 @@ class DeploymentDBSource:
     async def fetch_kernels_by_session_ids(
         self,
         session_ids: list[SessionId],
-    ) -> list[tuple[KernelId, SessionId]]:
-        """Fetch kernel IDs and their session IDs for given sessions.
+    ) -> list[tuple[KernelId, SessionId, AgentId | None]]:
+        """Fetch kernel IDs, their session IDs and their agents for given sessions.
 
         Args:
             session_ids: List of session IDs
 
         Returns:
-            List of (kernel_id, session_id) tuples
+            List of (kernel_id, session_id, agent_id) tuples
         """
         if not session_ids:
             return []
@@ -1525,10 +1526,14 @@ class DeploymentDBSource:
             query = sa.select(
                 KernelRow.id,
                 KernelRow.session_id,
+                KernelRow.agent,
             ).where(KernelRow.session_id.in_(session_ids))
 
             result = await db_sess.execute(query)
-            return [(KernelId(row[0]), SessionId(row[1])) for row in result]
+            return [
+                (KernelId(row[0]), SessionId(row[1]), AgentId(row[2]) if row[2] else None)
+                for row in result
+            ]
 
     async def _resolve_group_id(
         self,

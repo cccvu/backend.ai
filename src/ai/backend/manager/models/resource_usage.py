@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping, Sequence
 from datetime import datetime, tzinfo
 from decimal import Decimal
@@ -8,13 +9,13 @@ from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 import attrs
-import msgpack
 import sqlalchemy as sa
 from sqlalchemy.orm import joinedload, load_only
 from sqlalchemy.sql.elements import ColumnElement
 
 from ai.backend.common.types import SlotName
 from ai.backend.common.utils import nmget
+from ai.backend.logging.utils import BraceStyleAdapter
 from ai.backend.manager.data.kernel.types import KernelStatus
 
 if TYPE_CHECKING:
@@ -26,11 +27,15 @@ from .session import SessionRow
 from .user import UserRow
 from .utils import ExtendedAsyncSAEngine
 
+log = BraceStyleAdapter(logging.getLogger(__spec__.name))
+
 __all__: Sequence[str] = (
     "BaseResourceUsageGroup",
+    "KernelStatUsage",
     "ResourceGroupUnit",
     "ResourceUsage",
     "fetch_resource_usage",
+    "parse_kernel_stat_usage",
     "parse_resource_usage",
     "parse_resource_usage_groups",
 )
@@ -443,14 +448,46 @@ def parse_total_resource_group(
     return group_map, total_usage
 
 
+@attrs.define(slots=True, frozen=True)
+class KernelStatUsage:
+    """Utilization figures taken from a kernel's statistics."""
+
+    cpu_used: float = 0.0
+    mem_used: int = 0
+    disk_used: int = 0
+    io_read: int = 0
+    io_write: int = 0
+
+
+def parse_kernel_stat_usage(
+    kernel_id: Any,
+    last_stat: Mapping[str, Any] | None,
+) -> KernelStatUsage:
+    """
+    Extract the utilization figures from a kernel's statistics.
+    Missing statistics give zeros; malformed ones are ignored the same way.
+    """
+    if not last_stat:
+        return KernelStatUsage()
+    try:
+        return KernelStatUsage(
+            cpu_used=float(nmget(last_stat, "cpu_used.current", 0)),
+            mem_used=int(nmget(last_stat, "mem.capacity", 0)),
+            disk_used=int(nmget(last_stat, "io_scratch_size/stats.max", 0, "/")),
+            io_read=int(nmget(last_stat, "io_read.current", 0)),
+            io_write=int(nmget(last_stat, "io_write.current", 0)),
+        )
+    except (TypeError, ValueError, ArithmeticError):
+        log.warning("Ignoring malformed statistics of kernel {}", kernel_id)
+        return KernelStatUsage()
+
+
 def parse_resource_usage(
     kernel: KernelRow,
     last_stat: Mapping[str, Any] | None,
 ) -> ResourceUsage:
-    if not last_stat:
-        return ResourceUsage(
-            agent_ids={kernel.agent} if kernel.agent else set(),
-        )
+    # A kernel without statistics still reports its allocation.
+    stat_usage = parse_kernel_stat_usage(kernel.id, last_stat)
     nfs = set()
     if kernel.vfolder_mounts:
         # For >=22.03, return used host directories instead of volume host, which is not so useful.
@@ -477,14 +514,14 @@ def parse_resource_usage(
         agent_ids={kernel.agent} if kernel.agent else set(),
         nfs={*nfs},
         cpu_allocated=float(kernel.occupied_slots.get("cpu", 0)),
-        cpu_used=float(nmget(last_stat, "cpu_used.current", 0)),
+        cpu_used=stat_usage.cpu_used,
         mem_allocated=int(kernel.occupied_slots.get("mem", 0)),
-        mem_used=int(nmget(last_stat, "mem.capacity", 0)),
+        mem_used=stat_usage.mem_used,
         shared_memory=int(nmget(kernel.resource_opts or {}, "shmem", 0)),
         disk_allocated=0,
-        disk_used=int(nmget(last_stat, "io_scratch_size/stats.max", 0, "/")),
-        io_read=int(nmget(last_stat, "io_read.current", 0)),
-        io_write=int(nmget(last_stat, "io_write.current", 0)),
+        disk_used=stat_usage.disk_used,
+        io_read=stat_usage.io_read,
+        io_write=stat_usage.io_write,
         device_type={*device_type},
         smp=float(smp),
         gpu_mem_allocated=float(gpu_mem_allocated),
@@ -498,14 +535,15 @@ async def parse_resource_usage_groups(
     local_tz: tzinfo,
 ) -> list[BaseResourceUsageGroup]:
     stat_map = {k.id: k.last_stat for k in kernels}
-    stat_empty_kerns = [k.id for k in kernels if not k.last_stat]
+    stat_empty_kerns = [k for k in kernels if not k.last_stat]
 
-    kernel_ids_str = [str(kern_id) for kern_id in stat_empty_kerns]
-    raw_stats = await valkey_stat_client.get_user_kernel_statistics_batch(kernel_ids_str)
-    for kern_id, raw_stat in zip(stat_empty_kerns, raw_stats, strict=True):
-        if raw_stat is None:
+    live_stats = await valkey_stat_client.get_user_kernel_statistics_batch([
+        (kern.agent, str(kern.id)) for kern in stat_empty_kerns
+    ])
+    for kern, live_stat in zip(stat_empty_kerns, live_stats, strict=True):
+        if live_stat is None:
             continue
-        stat_map[kern_id] = msgpack.unpackb(raw_stat)
+        stat_map[kern.id] = live_stat
 
     return [
         BaseResourceUsageGroup(

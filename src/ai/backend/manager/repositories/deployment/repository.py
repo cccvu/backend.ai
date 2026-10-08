@@ -31,6 +31,7 @@ from ai.backend.common.resilience.policies.metrics import MetricArgs, MetricPoli
 from ai.backend.common.resilience.policies.retry import BackoffStrategy, RetryArgs, RetryPolicy
 from ai.backend.common.resilience.resilience import Resilience
 from ai.backend.common.types import (
+    AgentId,
     AutoScalingMetricSource,
     KernelId,
     MountPermission,
@@ -859,7 +860,7 @@ class DeploymentRepository:
 
         # Determine which metrics we need to fetch based on rules
         metric_requested_sessions: list[SessionId] = []
-        metric_requested_kernels: list[KernelId] = []
+        metric_requested_kernels: list[tuple[KernelId, AgentId | None]] = []
         metric_requested_deployments: list[DeploymentID] = []
         kernels_by_session_id: dict[SessionId, list[KernelId]] = defaultdict(list)
 
@@ -884,9 +885,9 @@ class DeploymentRepository:
             kernel_rows = await self._db_source.fetch_kernels_by_session_ids(
                 list(set(metric_requested_sessions))
             )
-            for kernel_id, session_id in kernel_rows:
+            for kernel_id, session_id, agent_id in kernel_rows:
                 kernels_by_session_id[session_id].append(kernel_id)
-                metric_requested_kernels.append(kernel_id)
+                metric_requested_kernels.append((kernel_id, agent_id))
 
         # Batch fetch metrics from Valkey
         kernel_statistics_by_id: dict[KernelId, Mapping[str, Any] | None] = {}
@@ -895,11 +896,11 @@ class DeploymentRepository:
         if metric_requested_kernels:
             kernel_live_stats = await KernelStatistics.batch_load_by_kernel_impl(
                 self._valkey_stat,
-                cast(list[SessionId], metric_requested_kernels),
+                metric_requested_kernels,
             )
             kernel_statistics_by_id = {
                 kernel_id: metric
-                for kernel_id, metric in zip(
+                for (kernel_id, _), metric in zip(
                     metric_requested_kernels, kernel_live_stats, strict=True
                 )
             }
