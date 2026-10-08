@@ -66,7 +66,6 @@ class BgtaskRegistryDependency(
                 session_repository=setup_input.repositories.session.repository,
                 image_repository=setup_input.repositories.image.repository,
                 agent_registry=setup_input.agent_registry,
-                event_hub=setup_input.event_hub,
                 event_fetcher=setup_input.event_fetcher,
             )
         )

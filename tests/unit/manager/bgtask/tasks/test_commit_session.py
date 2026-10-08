@@ -1,12 +1,20 @@
 from __future__ import annotations
 
 import uuid
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from ai.backend.common.data.session.types import CustomizedImageVisibilityScope
-from ai.backend.common.types import SessionId
+from ai.backend.common.docker import ImageRef
+from ai.backend.common.events.event_types.bgtask.broadcast import (
+    BgtaskDoneEvent,
+    BgtaskFailedEvent,
+    BgtaskUpdatedEvent,
+)
+from ai.backend.common.exception import BgtaskFailedError
+from ai.backend.common.types import AgentId, SessionId
 from ai.backend.manager.bgtask.tasks.commit_session import (
     CommitSessionHandler,
     CommitSessionManifest,
@@ -106,7 +114,6 @@ class TestCommitSessionExecute:
             session_repository=session_repository,
             image_repository=AsyncMock(),
             agent_registry=AsyncMock(),
-            event_hub=MagicMock(),
             event_fetcher=MagicMock(),
         )
 
@@ -143,3 +150,145 @@ class TestCommitSessionExecute:
 
         _, kwargs = session_repository.resolve_image.call_args
         assert kwargs["alive_only"] is False
+
+
+class TestWaitForAgentBgtask:
+    """The commit waiter reads only the cache scope of the session's agent."""
+
+    def _make_handler(
+        self,
+        event_fetcher: MagicMock,
+        *,
+        session_repository: AsyncMock | None = None,
+        agent_registry: AsyncMock | None = None,
+        timeout: float = 5.0,
+    ) -> CommitSessionHandler:
+        return CommitSessionHandler(
+            session_repository=session_repository or AsyncMock(),
+            image_repository=AsyncMock(),
+            agent_registry=agent_registry or AsyncMock(),
+            event_fetcher=event_fetcher,
+            agent_bgtask_timeout=timeout,
+            agent_bgtask_poll_interval=0.01,
+        )
+
+    def _fetcher(self, *events: Any) -> MagicMock:
+        event_fetcher = MagicMock()
+        event_fetcher.fetch_cached_event = AsyncMock(side_effect=[*events])
+        return event_fetcher
+
+    async def test_reads_the_agent_scope_until_done(self) -> None:
+        task_id = uuid.uuid4()
+        other_task_id = uuid.uuid4()
+        event_fetcher = self._fetcher(
+            None,
+            BgtaskUpdatedEvent(task_id=task_id, current_progress=0, total_progress=0),
+            # An event for another task is ignored.
+            BgtaskFailedEvent(task_id=other_task_id, message="other"),
+            BgtaskDoneEvent(task_id=task_id, message="ok"),
+        )
+        handler = self._make_handler(event_fetcher)
+
+        await handler._wait_for_agent_bgtask(task_id, "Commit", AgentId("agent-1"))
+
+        cache_ids = {call.args[0] for call in event_fetcher.fetch_cached_event.await_args_list}
+        assert cache_ids == {f"bgtask.agent.agent-1.{task_id}"}
+        assert event_fetcher.fetch_cached_event.await_count == 4
+
+    async def test_accepts_a_task_id_string(self) -> None:
+        # The agent RPC returns the task ID as a string.
+        task_id = uuid.uuid4()
+        event_fetcher = self._fetcher(BgtaskDoneEvent(task_id=task_id, message="ok"))
+        handler = self._make_handler(event_fetcher)
+
+        await handler._wait_for_agent_bgtask(
+            cast(uuid.UUID, str(task_id)), "Commit", AgentId("agent-1")
+        )
+
+    async def test_failure_is_raised(self) -> None:
+        task_id = uuid.uuid4()
+        event_fetcher = self._fetcher(BgtaskFailedEvent(task_id=task_id, message="boom"))
+        handler = self._make_handler(event_fetcher)
+
+        with pytest.raises(BgtaskFailedError):
+            await handler._wait_for_agent_bgtask(task_id, "Commit", AgentId("agent-1"))
+
+    async def test_times_out(self) -> None:
+        task_id = uuid.uuid4()
+        event_fetcher = MagicMock()
+        event_fetcher.fetch_cached_event = AsyncMock(
+            return_value=BgtaskUpdatedEvent(task_id=task_id, current_progress=0, total_progress=0)
+        )
+        handler = self._make_handler(event_fetcher, timeout=0.1)
+
+        with pytest.raises(BgtaskFailedError):
+            await handler._wait_for_agent_bgtask(task_id, "Push", AgentId("agent-1"))
+
+    async def test_fetch_errors_do_not_end_the_wait(self) -> None:
+        task_id = uuid.uuid4()
+        event_fetcher = self._fetcher(
+            RuntimeError("connection lost"), BgtaskDoneEvent(task_id=task_id, message="ok")
+        )
+        handler = self._make_handler(event_fetcher)
+
+        await handler._wait_for_agent_bgtask(task_id, "Commit", AgentId("agent-1"))
+
+    def test_rejects_non_positive_bounds(self) -> None:
+        with pytest.raises(ValueError):
+            CommitSessionHandler(
+                session_repository=AsyncMock(),
+                image_repository=AsyncMock(),
+                agent_registry=AsyncMock(),
+                event_fetcher=MagicMock(),
+                agent_bgtask_timeout=0,
+            )
+
+    async def test_execute_waits_on_the_main_kernel_agent(
+        self, sample_manifest: CommitSessionManifest
+    ) -> None:
+        task_id = uuid.uuid4()
+        session = MagicMock()
+        session.main_kernel.agent = "agent-1"
+        session.main_kernel.image = "registry.example.com/test-project/base:latest"
+        session.main_kernel.architecture = "x86_64"
+        image_row = MagicMock()
+        image_row.image_ref = ImageRef.from_image_str(
+            "registry.example.com/test-project/base:latest",
+            None,
+            "registry.example.com",
+            architecture="x86_64",
+            is_local=True,
+        )
+        session_repository = AsyncMock()
+        session_repository.get_session_by_id.return_value = session
+        session_repository.get_container_registry.return_value = MagicMock()
+        session_repository.resolve_image.return_value = image_row
+        session_repository.get_existing_customized_image.return_value = None
+        agent_registry = AsyncMock()
+        agent_registry.commit_session.return_value = {"bgtask_id": str(task_id)}
+        event_fetcher = self._fetcher(BgtaskFailedEvent(task_id=task_id, message="boom"))
+        handler = self._make_handler(
+            event_fetcher,
+            session_repository=session_repository,
+            agent_registry=agent_registry,
+        )
+
+        with pytest.raises(BgtaskFailedError):
+            await handler.execute(sample_manifest)
+
+        event_fetcher.fetch_cached_event.assert_awaited_once_with(f"bgtask.agent.agent-1.{task_id}")
+
+    async def test_execute_requires_an_agent(self, sample_manifest: CommitSessionManifest) -> None:
+        session = MagicMock()
+        session.main_kernel.agent = None
+        session_repository = AsyncMock()
+        session_repository.get_session_by_id.return_value = session
+        session_repository.get_container_registry.return_value = MagicMock()
+        agent_registry = AsyncMock()
+        handler = self._make_handler(
+            MagicMock(), session_repository=session_repository, agent_registry=agent_registry
+        )
+
+        with pytest.raises(BgtaskFailedError):
+            await handler.execute(sample_manifest)
+        agent_registry.commit_session.assert_not_called()

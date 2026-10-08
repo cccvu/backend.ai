@@ -72,7 +72,6 @@ class TestBgtaskRegistryDependency:
                 session_repository=mock_repositories.session.repository,
                 image_repository=mock_repositories.image.repository,
                 agent_registry=mock_agent_registry,
-                event_hub=mock_event_hub,
                 event_fetcher=mock_event_fetcher,
             )
 

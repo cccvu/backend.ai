@@ -3,7 +3,8 @@ from typing import Final
 
 from ai.backend.common.events.dispatcher import EventProducer
 from ai.backend.common.events.event_types.bgtask.broadcast import BgtaskUpdatedEvent
-from ai.backend.common.events.types import EventCacheDomain
+
+from .types import bgtask_cache_id
 
 
 class ProgressReporter:
@@ -12,6 +13,7 @@ class ProgressReporter:
 
     _event_producer: Final[EventProducer]
     _task_id: Final[uuid.UUID]
+    _cache_id: Final[str]
 
     def __init__(
         self,
@@ -19,9 +21,12 @@ class ProgressReporter:
         task_id: uuid.UUID,
         current_progress: int = 0,
         total_progress: int = 0,
+        *,
+        cache_scope: str | None = None,
     ) -> None:
         self._event_producer = event_producer
         self._task_id = task_id
+        self._cache_id = bgtask_cache_id(task_id, cache_scope)
         self.current_progress = current_progress
         self.total_progress = total_progress
 
@@ -35,7 +40,7 @@ class ProgressReporter:
         # due to interleaving at await statements below.
         current, total = self.current_progress, self.total_progress
         await self._event_producer.broadcast_event_with_cache(
-            EventCacheDomain.BGTASK.cache_id(str(self._task_id)),
+            self._cache_id,
             BgtaskUpdatedEvent(
                 self._task_id,
                 message=message,
