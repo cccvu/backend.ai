@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from ai.backend.manager.dependencies.orchestration.sokovan import (
     SokovanOrchestratorDependency,
@@ -37,6 +37,7 @@ class TestSokovanOrchestratorDependency:
     ) -> None:
         """Dependency should create and yield sokovan orchestrator."""
         mock_components = MagicMock()
+        mock_components.launcher.close = AsyncMock()
         mock_create_components.return_value = mock_components
 
         mock_handlers = MagicMock()
@@ -78,6 +79,10 @@ class TestSokovanOrchestratorDependency:
             mock_create_components.assert_called_once()
             mock_create_handlers.assert_called_once()
             mock_orchestrator_class.assert_called_once()
+            mock_components.launcher.close.assert_not_awaited()
+
+        # Teardown cancels the launcher's in-flight kernel creations.
+        mock_components.launcher.close.assert_awaited_once()
 
     @patch("ai.backend.manager.dependencies.orchestration.sokovan.create_coordinator_handlers")
     @patch(
@@ -100,6 +105,7 @@ class TestSokovanOrchestratorDependency:
     ) -> None:
         """Dependency should pass correct arguments to scheduler components factory."""
         mock_components = MagicMock()
+        mock_components.launcher.close = AsyncMock()
         mock_create_components.return_value = mock_components
         mock_create_handlers.return_value = MagicMock()
         mock_orchestrator_class.return_value = MagicMock()

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Awaitable, Callable
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 from uuid import UUID
@@ -81,6 +82,7 @@ class TestLauncherRPCTimeouts:
         session_for_start_multi_node: SessionDataForStart,
         image_config_default: dict[UUID, ImageConfigData],
         caplog: pytest.LogCaptureFixture,
+        drain: Callable[[SessionLauncher], Awaitable[None]],
     ) -> None:
         per_agent_client_pool.client(AgentId("agent-1")).create_kernels.side_effect = _hang
         per_agent_client_pool.client(AgentId("agent-2")).create_kernels.return_value = None
@@ -91,6 +93,8 @@ class TestLauncherRPCTimeouts:
                 [session_for_start_multi_node],
                 image_config_default,
             )
+        # A background task awaits the replies under the (shortened) per-RPC bound.
+        await drain(launcher)
         elapsed = time.monotonic() - started
 
         per_agent_client_pool.client(AgentId("agent-1")).create_kernels.assert_awaited_once()
@@ -121,6 +125,8 @@ class TestLauncherRPCTimeouts:
         elapsed = time.monotonic() - started
 
         agent_client.assign_port.assert_awaited_once()
+        # The session failed before dispatch: no kernel creation was spawned.
+        assert not launcher._kernel_creations
         agent_client.create_kernels.assert_not_awaited()
         mock_repository.update_session_error_info.assert_awaited_once()
         assert "TimeoutError" in str(mock_repository.update_session_error_info.await_args)
@@ -146,6 +152,8 @@ class TestLauncherRPCTimeouts:
         elapsed = time.monotonic() - started
 
         agent_client.create_local_network.assert_awaited_once()
+        # The session failed before dispatch: no kernel creation was spawned.
+        assert not launcher._kernel_creations
         agent_client.create_kernels.assert_not_awaited()
         mock_repository.update_session_error_info.assert_awaited_once()
         assert "TimeoutError" in str(mock_repository.update_session_error_info.await_args)
