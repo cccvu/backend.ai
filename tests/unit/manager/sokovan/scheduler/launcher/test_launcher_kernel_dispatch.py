@@ -130,6 +130,98 @@ class TestKernelCreationDispatch:
 
         assert start_done_on_entry == [False]
 
+    async def test_start_waits_for_every_agents_handoff(
+        self,
+        launcher: SessionLauncher,
+        per_agent_client_pool: MagicMock,
+        session_for_start_multi_node: SessionDataForStart,
+        image_config_default: dict[UUID, ImageConfigData],
+    ) -> None:
+        gate = asyncio.Event()
+        slow_acquiring = asyncio.Event()
+
+        @asynccontextmanager
+        async def staggered_acquire(agent_id: AgentId) -> AsyncIterator[AsyncMock]:
+            # AGENT_2's first contact takes longer than AGENT_1's.
+            if agent_id == AGENT_2:
+                slow_acquiring.set()
+                await gate.wait()
+            yield per_agent_client_pool.client(agent_id)
+
+        per_agent_client_pool.acquire.side_effect = staggered_acquire
+
+        start_tasks: list[asyncio.Task[RecordPool[SessionId]]] = []
+        start_done_on_entry: dict[AgentId, bool] = {}
+
+        def record_entry(agent_id: AgentId) -> Callable[..., Coroutine[Any, Any, None]]:
+            async def entered(*args: Any, **kwargs: Any) -> None:
+                start_done_on_entry[agent_id] = start_tasks[0].done()
+                await asyncio.Event().wait()  # neither agent replies
+
+            return entered
+
+        for agent_id in (AGENT_1, AGENT_2):
+            per_agent_client_pool.client(agent_id).create_kernels.side_effect = record_entry(
+                agent_id
+            )
+
+        async with asyncio.timeout(BOUND):
+            start = asyncio.create_task(
+                _start(launcher, session_for_start_multi_node, image_config_default)
+            )
+            start_tasks.append(start)
+            await slow_acquiring.wait()
+            for _ in range(10):
+                await asyncio.sleep(0)
+            # AGENT_1's request is handed off; the pass still waits for AGENT_2's.
+            assert start_done_on_entry == {AGENT_1: False}
+            assert not start.done()
+
+            gate.set()
+            await start
+
+        assert start_done_on_entry == {AGENT_1: False, AGENT_2: False}
+
+    async def test_call_failing_before_handoff_releases_it(
+        self,
+        launcher: SessionLauncher,
+        per_agent_client_pool: MagicMock,
+        mock_valkey_schedule: AsyncMock,
+        session_for_start_multi_node: SessionDataForStart,
+        image_config_default: dict[UUID, ImageConfigData],
+        drain: Callable[[SessionLauncher], Awaitable[None]],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # A bound far above the enforced limit: only the release can end the pass's wait.
+        monkeypatch.setattr(launcher_module, "KERNEL_CREATION_HANDOFF_TIMEOUT_SEC", 60)
+        proceed = asyncio.Event()
+
+        @asynccontextmanager
+        async def unreachable_agent_1(agent_id: AgentId) -> AsyncIterator[AsyncMock]:
+            if agent_id == AGENT_1:
+                raise ConnectionError("agent-1 unreachable")
+            yield per_agent_client_pool.client(agent_id)
+
+        async def reply_when_told(*args: Any, **kwargs: Any) -> None:
+            await proceed.wait()
+
+        per_agent_client_pool.acquire.side_effect = unreachable_agent_1
+        per_agent_client_pool.client(AGENT_2).create_kernels.side_effect = reply_when_told
+
+        async with asyncio.timeout(BOUND):
+            # AGENT_2 is handed off but has not replied, so the creation task is still running:
+            # only AGENT_1's own release ends the pass's wait.
+            await _start(launcher, session_for_start_multi_node, image_config_default)
+            assert len(launcher._kernel_creations) == 1
+            per_agent_client_pool.client(AGENT_1).create_kernels.assert_not_awaited()
+
+            proceed.set()
+            await drain(launcher)
+
+        mock_valkey_schedule.record_session_failed_agents.assert_awaited_once_with(
+            session_for_start_multi_node.session_id, [AGENT_1]
+        )
+
     async def test_handoff_wait_is_bounded(
         self,
         launcher: SessionLauncher,

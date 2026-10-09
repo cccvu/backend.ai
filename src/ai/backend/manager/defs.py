@@ -123,7 +123,9 @@ DEFAULT_PROJECT_NAME: Final = "default"
 DEFAULT_SHARED_MEMORY_SIZE: Final[str] = "64m"
 START_SESSION_TIMEOUT_SEC: Final[float] = 60 * 30  # 30 min
 # How long starting a session waits for its create_kernels requests to be handed off.
-# It bounds only local work (the agent client pool's acquire) and never waits on an agent.
+# It bounds the agent client pool's acquire, which may connect to an agent it has not reached
+# yet, and never waits for a create_kernels reply. A request not handed off in time is still
+# sent once acquired, unless the manager stops first: then the session stays in CREATING.
 KERNEL_CREATION_HANDOFF_TIMEOUT_SEC: Final[float] = 10
 
 # Upper bounds for agent RPCs awaited by the sokovan scheduler.
