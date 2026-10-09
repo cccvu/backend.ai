@@ -10,6 +10,7 @@ Test Scenarios:
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from unittest.mock import AsyncMock, MagicMock
 from uuid import UUID
 
@@ -159,6 +160,7 @@ class TestSessionLauncherKernelCreation:
         mock_agent_client_pool: MagicMock,
         session_for_start_single_kernel: SessionDataForStart,
         image_config_default: dict[UUID, ImageConfigData],
+        drain: Callable[[SessionLauncher], Awaitable[None]],
     ) -> None:
         """SC-LA-005: Single kernel session started successfully.
 
@@ -172,6 +174,7 @@ class TestSessionLauncherKernelCreation:
                 [session_for_start_single_kernel],
                 image_config_default,
             )
+        await drain(launcher)
 
         # Assert
         mock_client = mock_agent_client_pool._mock_client
@@ -188,6 +191,7 @@ class TestSessionLauncherKernelCreation:
         mock_agent_client_pool: MagicMock,
         session_for_start_multi_kernel: SessionDataForStart,
         image_config_default: dict[UUID, ImageConfigData],
+        drain: Callable[[SessionLauncher], Awaitable[None]],
     ) -> None:
         """SC-LA-006: Multi-kernel cluster session started.
 
@@ -201,6 +205,7 @@ class TestSessionLauncherKernelCreation:
                 [session_for_start_multi_kernel],
                 image_config_default,
             )
+        await drain(launcher)
 
         # Assert
         mock_client = mock_agent_client_pool._mock_client
@@ -241,6 +246,7 @@ class TestSessionLauncherKernelCreation:
         mock_agent_client_pool: MagicMock,
         session_for_start_single_kernel: SessionDataForStart,
         image_config_default: dict[UUID, ImageConfigData],
+        drain: Callable[[SessionLauncher], Awaitable[None]],
     ) -> None:
         """SC-LA-008: Multiple sessions started concurrently.
 
@@ -255,6 +261,7 @@ class TestSessionLauncherKernelCreation:
                 sessions,
                 image_config_default,
             )
+        await drain(launcher)
 
         # Assert - create_kernels called for each session
         mock_client = mock_agent_client_pool._mock_client

@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator
+import asyncio
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock
@@ -102,15 +103,15 @@ def mock_valkey_schedule() -> AsyncMock:
 
 
 @pytest.fixture
-def launcher(
+async def launcher(
     mock_repository: AsyncMock,
     mock_agent_client_pool: MagicMock,
     mock_network_plugin_ctx: MagicMock,
     mock_config_provider: MagicMock,
     mock_valkey_schedule: AsyncMock,
-) -> SessionLauncher:
-    """Create SessionLauncher with mocked dependencies."""
-    return SessionLauncher(
+) -> AsyncIterator[SessionLauncher]:
+    """Create SessionLauncher with mocked dependencies; cancels its kernel creations on teardown."""
+    launcher = SessionLauncher(
         SessionLauncherArgs(
             repository=mock_repository,
             agent_client_pool=mock_agent_client_pool,
@@ -119,6 +120,24 @@ def launcher(
             valkey_schedule=mock_valkey_schedule,
         )
     )
+    yield launcher
+    await launcher.close()
+
+
+async def _drain(launcher: SessionLauncher) -> None:
+    await asyncio.gather(*list(launcher._kernel_creations))
+    # Let the done callbacks drop the finished tasks.
+    await asyncio.sleep(0)
+
+
+@pytest.fixture
+def drain() -> Callable[[SessionLauncher], Awaitable[None]]:
+    """Waits for the launcher's background kernel creations to finish.
+
+    Starting a session only hands the create_kernels requests off; a background task awaits
+    the replies, so assertions on their outcome must drain first.
+    """
+    return _drain
 
 
 # =============================================================================

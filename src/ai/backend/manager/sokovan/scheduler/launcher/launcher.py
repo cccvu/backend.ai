@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import logging
+import time
 from collections import defaultdict
-from collections.abc import Awaitable, Mapping
+from collections.abc import Awaitable, Callable, Collection, Coroutine, Mapping
 from dataclasses import dataclass
 from itertools import groupby
 from typing import Any
@@ -14,6 +16,7 @@ from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 
+from ai.backend.common.asyncio import cancel_tasks
 from ai.backend.common.clients.valkey_client.valkey_schedule.client import ValkeyScheduleClient
 from ai.backend.common.docker import ImageRef
 from ai.backend.common.types import (
@@ -36,6 +39,7 @@ from ai.backend.manager.defs import (
     AGENT_CHECK_AND_PULL_TIMEOUT_SEC,
     AGENT_CREATE_KERNELS_TIMEOUT_SEC,
     AGENT_NETWORK_RPC_TIMEOUT_SEC,
+    KERNEL_CREATION_HANDOFF_TIMEOUT_SEC,
     START_SESSION_TIMEOUT_SEC,
 )
 from ai.backend.manager.exceptions import convert_to_status_data
@@ -57,6 +61,38 @@ from ai.backend.manager.views.sokovan.lifecycle import (
 )
 
 log = BraceStyleAdapter(logging.getLogger(__spec__.name))
+
+
+class _Handoff:
+    """
+    Tracks which agents' create_kernels requests are still waiting to be handed off.
+
+    An agent is released once its request is queued on the agent's peer, or once its call
+    has ended without queueing it. Releasing an agent twice has no further effect.
+    """
+
+    _pending: set[AgentId]
+    _done: asyncio.Event
+
+    def __init__(self, agent_ids: Collection[AgentId]) -> None:
+        self._pending = set(agent_ids)
+        self._done = asyncio.Event()
+        if not self._pending:
+            self._done.set()
+
+    def release(self, agent_id: AgentId) -> None:
+        self._pending.discard(agent_id)
+        if not self._pending:
+            self._done.set()
+
+    def release_all(self) -> None:
+        """Release every agent still pending, e.g. when the creation task has ended."""
+        self._pending.clear()
+        self._done.set()
+
+    async def wait(self) -> None:
+        """Return once every agent is released."""
+        await self._done.wait()
 
 
 @dataclass
@@ -84,6 +120,7 @@ class SessionLauncher:
     _config_provider: ManagerConfigProvider
     _valkey_schedule: ValkeyScheduleClient
     _phase_metrics: SchedulerPhaseMetricObserver
+    _kernel_creations: set[asyncio.Task[None]]
 
     def __init__(self, args: SessionLauncherArgs) -> None:
         self._repository = args.repository
@@ -92,6 +129,33 @@ class SessionLauncher:
         self._config_provider = args.config_provider
         self._valkey_schedule = args.valkey_schedule
         self._phase_metrics = SchedulerPhaseMetricObserver.instance()
+        self._kernel_creations = set()
+
+    async def close(self) -> None:
+        """
+        Cancel the kernel creations still awaiting an agent's reply.
+
+        Requests already handed off stay queued and reach their agents; the agents' events
+        drive the sessions from there.
+        """
+        await cancel_tasks(self._kernel_creations)
+
+    def _spawn_kernel_creation(
+        self,
+        session_id: SessionId,
+        coro: Coroutine[Any, Any, None],
+    ) -> asyncio.Task[None]:
+        # The task outlives the scheduling pass, so it gets a fresh context: the pass's
+        # RecorderContext pool must not be reachable from it.
+        task = asyncio.create_task(
+            coro,
+            name=f"sokovan.create_kernels:{session_id}",
+            context=contextvars.Context(),
+        )
+        # The event loop keeps only weak references to tasks.
+        self._kernel_creations.add(task)
+        task.add_done_callback(self._kernel_creations.discard)
+        return task
 
     async def trigger_image_pulling(
         self,
@@ -318,6 +382,7 @@ class SessionLauncher:
             async def create_kernels_on_agent(
                 agent_id: AgentId,
                 agent_kernels: list[KernelBindingData],
+                handoff: _Handoff,
             ) -> None:
                 # Prepare kernel creation configs
                 kernel_ids = [k.kernel_id for k in agent_kernels]
@@ -421,6 +486,9 @@ class SessionLauncher:
                 # Create the kernels using connection pool
                 async with asyncio.timeout(AGENT_CREATE_KERNELS_TIMEOUT_SEC):
                     async with self._agent_client_pool.acquire(agent_id) as client:
+                        # Nothing suspends from here until the request is queued on the
+                        # agent's peer, so the waiting START pass resumes only after that.
+                        handoff.release(agent_id)
                         await client.create_kernels(
                             session.session_id,
                             kernel_ids,
@@ -429,36 +497,37 @@ class SessionLauncher:
                             kernel_image_refs,
                         )
 
-            agent_ids_ordered: list[AgentId] = []
-            create_tasks: list[Awaitable[None]] = []
-            for agent_id, agent_kernels in kernels_by_agent.items():
-                agent_ids_ordered.append(agent_id)
-                create_tasks.append(create_kernels_on_agent(agent_id, agent_kernels))
-
-            if create_tasks:
-                results = await asyncio.gather(*create_tasks, return_exceptions=True)
-                failures = {
-                    aid: result
-                    for aid, result in zip(agent_ids_ordered, results, strict=True)
-                    if isinstance(result, BaseException)
-                }
-                failed_agent_ids = list(failures)
-                if failed_agent_ids:
+            if kernels_by_agent:
+                # The replies are awaited by a background task, outside the scheduler's lock;
+                # this pass waits only until every request is handed off.
+                handoff = _Handoff(kernels_by_agent.keys())
+                creation = self._spawn_kernel_creation(
+                    session.session_id,
+                    self._finish_kernel_creation(
+                        session,
+                        log_fmt,
+                        log_args,
+                        kernels_by_agent,
+                        create_kernels_on_agent,
+                        handoff,
+                    ),
+                )
+                # Also covers a task cancelled before its first step, whose body never runs.
+                creation.add_done_callback(lambda _: handoff.release_all())
+                log.info(
+                    log_fmt + "kernel creation requested on agents {}",
+                    *log_args,
+                    list(kernels_by_agent),
+                )
+                try:
+                    async with asyncio.timeout(KERNEL_CREATION_HANDOFF_TIMEOUT_SEC):
+                        await handoff.wait()
+                except TimeoutError:
                     log.warning(
-                        log_fmt + "recording failed agents: {}",
+                        log_fmt + "kernel creation not handed off to every agent within {}s",
                         *log_args,
-                        {aid: repr(exc) for aid, exc in failures.items()},
+                        KERNEL_CREATION_HANDOFF_TIMEOUT_SEC,
                     )
-                    try:
-                        await self._valkey_schedule.record_session_failed_agents(
-                            session.session_id, failed_agent_ids
-                        )
-                    except Exception:
-                        log.warning(
-                            log_fmt + "failed to record failed agents in Valkey",
-                            *log_args,
-                            exc_info=True,
-                        )
 
             log.info(log_fmt + "started", *log_args)
 
@@ -469,6 +538,72 @@ class SessionLauncher:
             # Update error info in status_data without changing status
             # Session will be handled by timeout detection in Coordinator
             await self._repository.update_session_error_info(session.session_id, error_info)
+
+    async def _finish_kernel_creation(
+        self,
+        session: SessionDataForStart,
+        log_fmt: str,
+        log_args: tuple[Any, ...],
+        kernels_by_agent: Mapping[AgentId, list[KernelBindingData]],
+        create_kernels_on_agent: Callable[
+            [AgentId, list[KernelBindingData], _Handoff], Coroutine[Any, Any, None]
+        ],
+        handoff: _Handoff,
+    ) -> None:
+        """
+        Await every agent's create_kernels reply and record the agents that failed.
+
+        Runs as a tracked background task (see _spawn_kernel_creation).
+        """
+        started = time.monotonic()
+
+        async def create_on_agent(
+            agent_id: AgentId, agent_kernels: list[KernelBindingData]
+        ) -> None:
+            try:
+                await create_kernels_on_agent(agent_id, agent_kernels, handoff)
+            finally:
+                # Also releases a call that ended before handing off its request.
+                handoff.release(agent_id)
+
+        try:
+            agent_ids_ordered: list[AgentId] = []
+            create_tasks: list[Awaitable[None]] = []
+            for agent_id, agent_kernels in kernels_by_agent.items():
+                agent_ids_ordered.append(agent_id)
+                create_tasks.append(create_on_agent(agent_id, agent_kernels))
+
+            results = await asyncio.gather(*create_tasks, return_exceptions=True)
+            failures = {
+                aid: result
+                for aid, result in zip(agent_ids_ordered, results, strict=True)
+                if isinstance(result, BaseException)
+            }
+            failed_agent_ids = list(failures)
+            if failed_agent_ids:
+                log.warning(
+                    log_fmt + "recording failed agents: {}",
+                    *log_args,
+                    {aid: repr(exc) for aid, exc in failures.items()},
+                )
+                try:
+                    await self._valkey_schedule.record_session_failed_agents(
+                        session.session_id, failed_agent_ids
+                    )
+                except Exception:
+                    log.warning(
+                        log_fmt + "failed to record failed agents in Valkey",
+                        *log_args,
+                        exc_info=True,
+                    )
+            log.info(
+                log_fmt + "kernel creation finished on agents {} in {:.3f}s",
+                *log_args,
+                agent_ids_ordered,
+                time.monotonic() - started,
+            )
+        except Exception:
+            log.exception(log_fmt + "kernel creation failed unexpectedly", *log_args)
 
     async def _setup_network_configuration(
         self,

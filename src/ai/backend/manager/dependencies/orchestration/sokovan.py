@@ -217,4 +217,7 @@ class SokovanOrchestratorDependency(
 
         log.info("Sokovan orchestrator initialized")
 
-        yield orchestrator
+        try:
+            yield orchestrator
+        finally:
+            await scheduler_components.launcher.close()
