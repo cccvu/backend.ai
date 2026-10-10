@@ -19,6 +19,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from ai.backend.common.asyncio import cancel_tasks
 from ai.backend.common.clients.valkey_client.valkey_schedule.client import ValkeyScheduleClient
 from ai.backend.common.docker import ImageRef
+from ai.backend.common.events.event_types.kernel.types import KernelLifecycleEventReason
 from ai.backend.common.types import (
     AgentId,
     AutoPullBehavior,
@@ -34,10 +35,12 @@ from ai.backend.common.types import (
 from ai.backend.logging.utils import BraceStyleAdapter
 from ai.backend.manager.clients.agent import AgentClientPool
 from ai.backend.manager.config.provider import ManagerConfigProvider
+from ai.backend.manager.data.kernel.types import KernelInfo, KernelStatus
 from ai.backend.manager.defs import (
     AGENT_ASSIGN_PORT_TIMEOUT_SEC,
     AGENT_CHECK_AND_PULL_TIMEOUT_SEC,
     AGENT_CREATE_KERNELS_TIMEOUT_SEC,
+    AGENT_DESTROY_KERNEL_TIMEOUT_SEC,
     AGENT_NETWORK_RPC_TIMEOUT_SEC,
     KERNEL_CREATION_HANDOFF_TIMEOUT_SEC,
     START_SESSION_TIMEOUT_SEC,
@@ -46,8 +49,11 @@ from ai.backend.manager.exceptions import convert_to_status_data
 from ai.backend.manager.metrics.scheduler import (
     SchedulerPhaseMetricObserver,
 )
+from ai.backend.manager.models.kernel.conditions import KernelConditions
 from ai.backend.manager.models.network import NetworkType
 from ai.backend.manager.plugin.network import NetworkPluginContext
+from ai.backend.manager.repositories.base import BatchQuerier
+from ai.backend.manager.repositories.base.pagination import NoPagination
 from ai.backend.manager.repositories.scheduler import (
     SchedulerRepository,
 )
@@ -604,6 +610,77 @@ class SessionLauncher:
             )
         except Exception:
             log.exception(log_fmt + "kernel creation failed unexpectedly", *log_args)
+        await self._destroy_kernels_terminated_during_creation(
+            session.session_id, log_fmt, log_args, kernels_by_agent
+        )
+
+    async def _destroy_kernels_terminated_during_creation(
+        self,
+        session_id: SessionId,
+        log_fmt: str,
+        log_args: tuple[Any, ...],
+        kernels_by_agent: Mapping[AgentId, list[KernelBindingData]],
+    ) -> None:
+        """
+        Destroy the requested kernels that reached a terminal status during their creation.
+
+        A session can be terminated while its kernels are being created. Its kernel rows are
+        then terminal, so a later kernel-started event is ignored and nothing else stops a
+        container the agent goes on to create. Best effort: failures are logged, not raised.
+        """
+        agent_by_kernel = {
+            k.kernel_id: agent_id for agent_id, kernels in kernels_by_agent.items() for k in kernels
+        }
+        try:
+            result = await self._repository.search_kernels_for_handler(
+                BatchQuerier(
+                    pagination=NoPagination(),
+                    conditions=[KernelConditions.by_ids(list(agent_by_kernel))],
+                )
+            )
+        except Exception:
+            log.warning(
+                log_fmt + "failed to re-read kernel statuses after creation",
+                *log_args,
+                exc_info=True,
+            )
+            return
+
+        async def destroy(kernel: KernelInfo, agent_id: AgentId) -> None:
+            reason = (
+                KernelLifecycleEventReason.from_value(kernel.lifecycle.status_info)
+                or KernelLifecycleEventReason.UNKNOWN
+            )
+            log.info(
+                log_fmt + "destroying kernel {} on agent {}: it became {} during its creation",
+                *log_args,
+                kernel.id,
+                agent_id,
+                kernel.lifecycle.status,
+            )
+            try:
+                async with asyncio.timeout(AGENT_DESTROY_KERNEL_TIMEOUT_SEC):
+                    async with self._agent_client_pool.acquire(agent_id) as client:
+                        await client.destroy_kernel(
+                            kernel.id, session_id, str(reason), suppress_events=True
+                        )
+            except Exception as e:
+                log.warning(
+                    log_fmt + "failed to destroy kernel {} on agent {}: {!r}",
+                    *log_args,
+                    kernel.id,
+                    agent_id,
+                    e,
+                )
+
+        await asyncio.gather(
+            *(
+                destroy(kernel, agent_by_kernel[kernel.id])
+                for kernel in result.items
+                if kernel.id in agent_by_kernel
+                and kernel.lifecycle.status in KernelStatus.terminal_statuses()
+            )
+        )
 
     async def _setup_network_configuration(
         self,
