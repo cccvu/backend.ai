@@ -1,8 +1,8 @@
-"""Kernels that reach a terminal status while being created are destroyed on their agents.
+"""Kernels terminated while being created are destroyed on their agents.
 
 A session can be terminated while its kernel creation is in flight. Once every agent's
 create_kernels call has ended, the launcher re-reads the kernels' statuses and sends a
-bounded destroy_kernel for each terminal one to the agent it was created on.
+bounded destroy_kernel for each terminating or terminal one to the agent it was created on.
 """
 
 from __future__ import annotations
@@ -131,17 +131,39 @@ class TestDestroyKernelsTerminatedDuringCreation:
             kernel_id, session.session_id, "unknown", suppress_events=True
         )
 
+    async def test_terminating_after_reply_is_destroyed(
+        self,
+        launcher: SessionLauncher,
+        per_agent_client_pool: MagicMock,
+        mock_repository: AsyncMock,
+        session_for_start_single_kernel: SessionDataForStart,
+        image_config_default: dict[UUID, ImageConfigData],
+        drain: Callable[[SessionLauncher], Awaitable[None]],
+    ) -> None:
+        # Still terminating at the re-read: it may turn terminal only afterwards.
+        session = session_for_start_single_kernel
+        kernel_id = session.kernels[0].kernel_id
+        mock_repository.search_kernels_for_handler.return_value = _kernels(
+            _kernel(kernel_id, KernelStatus.TERMINATING, "user-requested")
+        )
+
+        task = await _start_and_drain(launcher, session, image_config_default, drain)
+
+        assert task.exception() is None
+        per_agent_client_pool.client(AGENT_1).destroy_kernel.assert_awaited_once_with(
+            kernel_id, session.session_id, "user-requested", suppress_events=True
+        )
+
     @pytest.mark.parametrize(
         "status",
         [
+            KernelStatus.PENDING,
             KernelStatus.PREPARED,
             KernelStatus.CREATING,
             KernelStatus.RUNNING,
-            # Still being terminated: the terminator sends its own destroy.
-            KernelStatus.TERMINATING,
         ],
     )
-    async def test_non_terminal_is_left_alone(
+    async def test_live_kernel_is_left_alone(
         self,
         status: KernelStatus,
         launcher: SessionLauncher,

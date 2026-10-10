@@ -622,12 +622,14 @@ class SessionLauncher:
         kernels_by_agent: Mapping[AgentId, list[KernelBindingData]],
     ) -> None:
         """
-        Destroy the requested kernels that reached a terminal status during their creation.
+        Destroy the requested kernels that are terminating or terminal once their creation ended.
 
-        A session can be terminated while its kernels are being created. Its kernel rows are
-        then terminal, so a later kernel-started event is ignored and nothing else stops a
-        container the agent goes on to create. Best effort: failures are logged, not raised.
+        A session can be terminated while its kernels are being created. Re-checking after the
+        create's reply lets the agents converge on the manager's view of the session. A kernel
+        still terminating may turn terminal only after this read, so it is destroyed too; a
+        repeated destroy is idempotent on the agent. Best effort: failures are logged, not raised.
         """
+        statuses = KernelStatus.terminal_statuses() | {KernelStatus.TERMINATING}
         agent_by_kernel = {
             k.kernel_id: agent_id for agent_id, kernels in kernels_by_agent.items() for k in kernels
         }
@@ -677,8 +679,7 @@ class SessionLauncher:
             *(
                 destroy(kernel, agent_by_kernel[kernel.id])
                 for kernel in result.items
-                if kernel.id in agent_by_kernel
-                and kernel.lifecycle.status in KernelStatus.terminal_statuses()
+                if kernel.id in agent_by_kernel and kernel.lifecycle.status in statuses
             )
         )
 
