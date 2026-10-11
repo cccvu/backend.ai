@@ -135,6 +135,15 @@ else
   show_info "Skipped removal of Python virtual environments."
 fi
 
+# The halfstack's compose project, read before the compose file goes: its `name:`, else
+# COMPOSE_PROJECT_NAME, else the directory's name. Another checkout's halfstack may run on
+# the same host under another project.
+COMPOSE_PROJECT="${COMPOSE_PROJECT_NAME:-backendai}"
+if [ -f "docker-compose.halfstack.current.yml" ]; then
+  _name=$($docker_sudo $DOCKER_COMPOSE -f "docker-compose.halfstack.current.yml" config --format json 2>/dev/null | jq -r '.name // empty' 2>/dev/null || true)
+  COMPOSE_PROJECT="${_name:-$COMPOSE_PROJECT}"
+fi
+
 if [ $REMOVE_CONTAINERS -eq 1 ]; then
   show_info "Removing Docker containers..."
   if [ -f "docker-compose.halfstack.current.yml" ]; then
@@ -150,7 +159,7 @@ fi
 if [ $REMOVE_DB -eq 1 ]; then
   show_info "Removing data volumes..."
   rm -rf volumes
-  docker volume rm $(docker volume ls -q --filter 'label=com.docker.compose.project=backendai')
+  docker volume rm $(docker volume ls -q --filter "label=com.docker.compose.project=${COMPOSE_PROJECT}")
 fi
 
 echo ""
