@@ -168,6 +168,14 @@ usage() {
   echo "    The port to expose the manager API service."
   echo "    (default: 8091)"
   echo ""
+  echo "  ${LWHITE}--prometheus-port PORT${NC}"
+  echo "    The port to bind the Prometheus container service."
+  echo "    (default: 9090)"
+  echo ""
+  echo "  ${LWHITE}--apollo-router-port PORT${NC}"
+  echo "    The port to bind the GraphQL gateway container service."
+  echo "    (default: 4000)"
+  echo ""
   echo "  ${LWHITE}--agent-rpc-port PORT${NC}"
   echo "    The port for the manager-to-agent RPC calls."
   echo "    (default: 6011)"
@@ -393,6 +401,8 @@ APPPROXY_COORDINATOR_PORT="10200"
 APPPROXY_WORKER_PORT="10201"
 APPPROXY_IMPL="port"  # frontend server mode ("port" or "traefik")
 WSPROXY_PORT="5050"
+PROMETHEUS_PORT="9090"
+APOLLO_ROUTER_PORT="4000"
 AGENT_RPC_PORT="6011"
 AGENT_WATCHER_PORT="6019"
 AGENT_BACKEND="docker"
@@ -446,6 +456,10 @@ while [ $# -gt 0 ]; do
     --app-proxy-worker-port=*)       APPPROXY_WORKER_PORT="${1#*=}" ;;
     --app-proxy-impl)                APPPROXY_IMPL=$2; shift ;;
     --app-proxy-impl=*)              APPPROXY_IMPL="${1#*=}" ;;
+    --prometheus-port)      PROMETHEUS_PORT=$2; shift ;;
+    --prometheus-port=*)    PROMETHEUS_PORT="${1#*=}" ;;
+    --apollo-router-port)   APOLLO_ROUTER_PORT=$2; shift ;;
+    --apollo-router-port=*) APOLLO_ROUTER_PORT="${1#*=}" ;;
     --agent-rpc-port)       AGENT_RPC_PORT=$2; shift ;;
     --agent-rpc-port=*)     AGENT_RPC_PORT="${1#*=}" ;;
     --agent-watcher-port)   AGENT_WATCHER_PORT=$2; shift ;;
@@ -989,6 +1003,8 @@ setup_environment() {
     sed_inplace "s/8100:5432/${POSTGRES_PORT}:5432/" "docker-compose.halfstack.current.yml"
     sed_inplace "s/8110:6379/${REDIS_PORT}:6379/" "docker-compose.halfstack.current.yml"
     sed_inplace "s/8120:2379/${ETCD_PORT}:2379/" "docker-compose.halfstack.current.yml"
+    sed_inplace "s/\"9090:9090\"/\"${PROMETHEUS_PORT}:9090\"/" "docker-compose.halfstack.current.yml"
+    sed_inplace "s/\"4000:4000\"/\"${APOLLO_ROUTER_PORT}:4000\"/" "docker-compose.halfstack.current.yml"
 
     sed_inplace "s/\${REDIS_MASTER_PORT}/${REDIS_MASTER_PORT}/g" "docker-compose.halfstack.current.yml"
     sed_inplace "s/\${REDIS_SLAVE1_PORT}/${REDIS_SLAVE1_PORT}/g" "docker-compose.halfstack.current.yml"
@@ -1062,6 +1078,8 @@ setup_environment() {
   sed_inplace "s/8100:5432/${POSTGRES_PORT}:5432/" "docker-compose.halfstack.current.yml"
   sed_inplace "s/8110:6379/${REDIS_PORT}:6379/" "docker-compose.halfstack.current.yml"
   sed_inplace "s/8120:2379/${ETCD_PORT}:2379/" "docker-compose.halfstack.current.yml"
+  sed_inplace "s/\"9090:9090\"/\"${PROMETHEUS_PORT}:9090\"/" "docker-compose.halfstack.current.yml"
+  sed_inplace "s/\"4000:4000\"/\"${APOLLO_ROUTER_PORT}:4000\"/" "docker-compose.halfstack.current.yml"
 
   mkdir -p "${HALFSTACK_VOLUME_PATH}/postgres-data"
   mkdir -p "${HALFSTACK_VOLUME_PATH}/etcd-data"
@@ -1240,6 +1258,8 @@ configure_backendai() {
   # configure webserver
   cp configs/webserver/halfstack.conf ./webserver.conf
   sed_inplace "s/https:\/\/api.backend.ai/http:\/\/127.0.0.1:${MANAGER_PORT}/" ./webserver.conf
+  sed_inplace "s/^port = 8090$/port = ${WEBSERVER_PORT}/" ./webserver.conf
+  sed_inplace "s/127.0.0.1:4000/127.0.0.1:${APOLLO_ROUTER_PORT}/" ./webserver.conf
 
   if [ $CONFIGURE_HA -eq 1 ]; then
     sed_inplace "s/addr = \"localhost:8111\"/# addr = \"localhost:8111\"/" ./webserver.conf

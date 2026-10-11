@@ -2,6 +2,10 @@
 set -euo pipefail
 
 TMUX_SESSION="backend-ai-session"
+# Every service runs from (and with relative paths into) the checkout root, which is
+# the current directory of ./dev. Several checkouts may run their own services on one
+# host, so processes are matched by title *and* working directory, never by title alone.
+ROOT_DIR=$(pwd -P)
 
 _service_cmd() {
   case $1 in
@@ -74,6 +78,24 @@ _pid_alive() {
   [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
 }
 
+# The working directory of process $1.
+_pid_cwd() {
+  if [ -e "/proc/$1/cwd" ]; then
+    readlink "/proc/$1/cwd" 2>/dev/null || true
+  else
+    lsof -a -d cwd -p "$1" -Fn 2>/dev/null | sed -n 's/^n//p'
+  fi
+}
+
+# PIDs of this checkout's processes whose command line matches the pattern $1.
+_own_pids() {
+  local pid
+  for pid in $(pgrep -f "$1" 2>/dev/null); do
+    [ "$(_pid_cwd "$pid")" = "$ROOT_DIR" ] && echo "$pid"
+  done
+  return 0
+}
+
 _is_running() {
   local svc=$1
   case "$svc" in
@@ -89,7 +111,7 @@ _is_running() {
       return 1
       ;;
     *)
-      pgrep -f "$(_service_process "$svc")" > /dev/null 2>&1
+      [ -n "$(_own_pids "$(_service_process "$svc")")" ]
       ;;
   esac
 }
@@ -115,7 +137,10 @@ _stop_service() {
         _kill_by_pidfile "$signal"
         ;;
       *)
-        pkill "-${signal}" -f "$(_service_process "$svc")" 2>/dev/null || true
+        local pid
+        for pid in $(_own_pids "$(_service_process "$svc")"); do
+          kill "-${signal}" "$pid" 2>/dev/null || true
+        done
         ;;
     esac
   }
@@ -154,11 +179,11 @@ _start_service() {
   if ! tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
     local winname
     winname=$(_tmux_window_name "$svc")
-    tmux new-session -d -s "$TMUX_SESSION" -n "$winname" "$cmd"
+    tmux new-session -d -s "$TMUX_SESSION" -c "$ROOT_DIR" -n "$winname" "$cmd"
   else
     local winname
   winname=$(_tmux_window_name "$svc")
-  tmux new-window -t "$TMUX_SESSION" -n "$winname" "$cmd"
+  tmux new-window -t "$TMUX_SESSION" -c "$ROOT_DIR" -n "$winname" "$cmd"
   fi
   echo "  Started $svc"
 }
@@ -173,7 +198,8 @@ _status_services() {
           pid=$(cat "$(_service_pidfile "$svc")" 2>/dev/null || true)
           ;;
         *)
-          pid=$(pgrep -f "$(_service_process "$svc")" | head -1)
+          pid=$(_own_pids "$(_service_process "$svc")")
+          pid=${pid%%$'\n'*}
           ;;
       esac
       printf "  %-20s %s (pid: %s)\n" "$svc" "$(_color green running)" "$pid"
