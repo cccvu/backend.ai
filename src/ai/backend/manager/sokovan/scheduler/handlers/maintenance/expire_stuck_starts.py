@@ -11,7 +11,7 @@ from ai.backend.common.events.event_types.kernel.types import KernelLifecycleEve
 from ai.backend.common.identifier.resource_group import ResourceGroupID
 from ai.backend.common.types import AccessKey, AgentId, SessionId
 from ai.backend.logging import BraceStyleAdapter
-from ai.backend.manager.data.kernel.types import KernelStatus
+from ai.backend.manager.data.kernel.types import KernelInfo, KernelStatus
 from ai.backend.manager.data.session.types import SessionStatus, StatusTransitions, TransitionStatus
 from ai.backend.manager.defs import (
     SESSION_CREATING_EXPIRY_SEC,
@@ -60,7 +60,9 @@ class ExpireStuckStartsLifecycleHandler(SessionLifecycleHandler):
 
     - SCHEDULED, PREPARED: ``SESSION_CREATING_EXPIRY_SEC``, whatever its kernels are doing.
     - CREATING: ``SESSION_CREATING_EXPIRY_SEC``, while some kernel has not started yet.
-    - PREPARING, PULLING: ``SESSION_PULLING_EXPIRY_SEC`` while some kernel is PULLING,
+    - PREPARING, PULLING: ``SESSION_PULLING_EXPIRY_SEC`` while some kernel is PULLING, or
+      waits for a pull another session's kernel started of the same image on the same agent
+      (the agent pulls an image once and reports the pull to the first session only);
       otherwise ``SESSION_CREATING_EXPIRY_SEC``, while some kernel has not finished preparing.
 
     Expired sessions are reported as successes; the coordinator moves them to TERMINATING with
@@ -220,6 +222,7 @@ class ExpireStuckStartsLifecycleHandler(SessionLifecycleHandler):
         now: datetime,
     ) -> list[SessionTransitionInfo]:
         expired: list[SessionTransitionInfo] = []
+        pulling = pulling_images(sessions)
         for session in sessions:
             session_info = session.session_info
             status = session_info.lifecycle.status
@@ -233,7 +236,7 @@ class ExpireStuckStartsLifecycleHandler(SessionLifecycleHandler):
                 )
                 continue
             age = (now - entered_at).total_seconds()
-            bound = expiry_bound(session)
+            bound = expiry_bound(session, pulling)
             if bound is None or age <= bound:
                 continue
             agents = sorted({
@@ -283,8 +286,35 @@ def sole_agent(session: SessionWithKernels) -> AgentId | None:
     return AgentId(agent)
 
 
-def expiry_bound(session: SessionWithKernels) -> float | None:
-    """Return the session's start bound in seconds, or None when it cannot be stuck starting."""
+def _pull_key(kernel: KernelInfo) -> tuple[str, object] | None:
+    """The (agent, image) a kernel's image pull runs as on its agent, or None if unknown."""
+    image = kernel.image.image_id or kernel.image.identifier
+    if not kernel.resource.agent or image is None:
+        return None
+    return kernel.resource.agent, image
+
+
+def pulling_images(sessions: Sequence[SessionWithKernels]) -> frozenset[tuple[str, object]]:
+    """The (agent, image) pairs the given sessions' PULLING kernels are pulling."""
+    return frozenset(
+        key
+        for session in sessions
+        for kernel in session.kernel_infos
+        if kernel.lifecycle.status == KernelStatus.PULLING
+        and (key := _pull_key(kernel)) is not None
+    )
+
+
+def expiry_bound(
+    session: SessionWithKernels,
+    pulling: frozenset[tuple[str, object]] = frozenset(),
+) -> float | None:
+    """Return the session's start bound in seconds, or None when it cannot be stuck starting.
+
+    ``pulling`` holds the (agent, image) pairs other sessions' kernels are pulling: an agent
+    pulls an image once, so a kernel waiting for the same image on the same agent never
+    reaches PULLING itself, yet waits as long as the pull does.
+    """
     status = session.session_info.lifecycle.status
     kernel_statuses = {k.lifecycle.status for k in session.kernel_infos}
     match status:
@@ -297,7 +327,12 @@ def expiry_bound(session: SessionWithKernels) -> float | None:
         case SessionStatus.PREPARING | SessionStatus.PULLING:
             if not kernel_statuses & KernelStatus.pre_prepared_statuses():
                 return None
-            if KernelStatus.PULLING in kernel_statuses:
+            waits_for_a_pull = bool(pulling) and any(
+                k.lifecycle.status in KernelStatus.pre_prepared_statuses()
+                and _pull_key(k) in pulling
+                for k in session.kernel_infos
+            )
+            if KernelStatus.PULLING in kernel_statuses or waits_for_a_pull:
                 return SESSION_PULLING_EXPIRY_SEC
             return SESSION_CREATING_EXPIRY_SEC
         case _:

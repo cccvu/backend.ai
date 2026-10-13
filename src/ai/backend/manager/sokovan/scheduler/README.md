@@ -813,12 +813,20 @@ age and agents.
 |--------|---------|-------------------|
 | SCHEDULED, PREPARED | `SESSION_CREATING_EXPIRY_SEC` (15 minutes) | always, past the bound |
 | CREATING | `SESSION_CREATING_EXPIRY_SEC` (15 minutes) | some kernel has not started yet |
-| PREPARING, PULLING | `SESSION_PULLING_EXPIRY_SEC` (2 h 15 min) while some kernel is PULLING, else `SESSION_CREATING_EXPIRY_SEC` | some kernel has not finished preparing |
+| PREPARING, PULLING | `SESSION_PULLING_EXPIRY_SEC` (2 h 15 min) while some kernel is PULLING or waits for another session's pull of the same image on the same agent, else `SESSION_CREATING_EXPIRY_SEC` | some kernel has not finished preparing |
 
 `SESSION_CREATING_EXPIRY_SEC` is `AGENT_CREATE_KERNELS_TIMEOUT_SEC` plus 5 minutes, so a
 `create_kernels` call in flight gets its full time; `SESSION_PULLING_EXPIRY_SEC` is above the
 agent's default image pull timeout (2 hours). A CREATING session whose kernels have all started,
 and a PREPARING session whose kernels are all prepared, are left to their promotion.
+
+An agent pulls an image once: a second session placed on the same agent for the same image waits
+for that pull without its kernels ever reaching PULLING, so it gets the pull bound while a kernel
+of another session in the same pass is PULLING that image there.
+
+These bounds are a ceiling that the per-handler `HandlerOptions.timeout` does not lift: a session
+or resource group's handler timeout can end a phase earlier, but a longer timeout, or `None`,
+leaves a stuck start to these bounds, since an unbounded start would hold its resources for good.
 
 Agent RPCs the scheduler awaits are bounded by the `AGENT_*_TIMEOUT_SEC` constants in `defs.py`.
 

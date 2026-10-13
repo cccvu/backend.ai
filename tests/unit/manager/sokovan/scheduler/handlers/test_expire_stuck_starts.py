@@ -221,6 +221,52 @@ class TestExpireStuckStartsLifecycleHandler:
 
         assert [s.session_id for s in result.successes] == _ids([past])
 
+    async def test_a_kernel_waiting_on_another_sessions_pull_gets_the_pull_bound(
+        self,
+        handler: ExpireStuckStartsLifecycleHandler,
+        session_factory: SessionFactory,
+    ) -> None:
+        """The agent pulls an image once and reports the pull to the first session only: a
+        session placed on the same agent for the same image waits in PREPARING with its kernel
+        short of PULLING for as long as the pull takes."""
+        image_id, other_image_id = uuid.uuid4(), uuid.uuid4()
+
+        def on(session: SessionWithKernels, agent: str, image: uuid.UUID) -> SessionWithKernels:
+            kernels = [
+                dataclasses.replace(
+                    k,
+                    image=dataclasses.replace(k.image, image_id=image),
+                    resource=dataclasses.replace(k.resource, agent=agent),
+                )
+                for k in session.kernel_infos
+            ]
+            return dataclasses.replace(session, kernel_infos=kernels)
+
+        puller = on(
+            _stuck(session_factory, SessionStatus.PREPARING, [KernelStatus.PULLING], 60),
+            "i-a",
+            image_id,
+        )
+        waiter, waiter_past, other_agent, other_image = (
+            on(
+                _stuck(session_factory, SessionStatus.PREPARING, [KernelStatus.SCHEDULED], age),
+                agent,
+                image,
+            )
+            for age, agent, image in (
+                (SESSION_CREATING_EXPIRY_SEC + 1, "i-a", image_id),
+                (SESSION_PULLING_EXPIRY_SEC + 1, "i-a", image_id),
+                (SESSION_CREATING_EXPIRY_SEC + 1, "i-b", image_id),
+                (SESSION_CREATING_EXPIRY_SEC + 1, "i-a", other_image_id),
+            )
+        )
+
+        result = await handler.execute(_RG, [puller, waiter, waiter_past, other_agent, other_image])
+
+        assert sorted(s.session_id for s in result.successes) == sorted(
+            _ids([waiter_past, other_agent, other_image])
+        )
+
     async def test_stuck_prepared_with_all_kernels_running_expires(
         self,
         handler: ExpireStuckStartsLifecycleHandler,
