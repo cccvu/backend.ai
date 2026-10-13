@@ -13,13 +13,15 @@ from ai.backend.common.clients.valkey_client.valkey_schedule.client import Valke
 from ai.backend.common.types import AgentId, KernelId, ResourceSlot, SessionId
 from ai.backend.logging.utils import BraceStyleAdapter
 from ai.backend.manager.clients.agent import AgentClientPool
-from ai.backend.manager.data.kernel.types import KernelInfo
+from ai.backend.manager.data.kernel.types import KernelInfo, KernelStatus
+from ai.backend.manager.data.session.types import SessionStatus
 from ai.backend.manager.defs import (
     AGENT_CHECK_RUNNING_TIMEOUT_SEC,
     AGENT_DESTROY_KERNEL_TIMEOUT_SEC,
 )
 from ai.backend.manager.repositories.scheduler import SchedulerRepository
 from ai.backend.manager.sokovan.recorder.context import RecorderContext
+from ai.backend.manager.sokovan.scheduler.types import ScheduleType
 from ai.backend.manager.views.sokovan.session import (
     KernelTerminationResult,
     TerminatingSessionData,
@@ -106,13 +108,15 @@ class SessionTerminator:
                     all_tasks.append(task)
                     task_session_ids.append(session.session_id)
                 else:
-                    # Kernel has no agent assigned - needs sweep
+                    # Never placed on an agent, so there is no container to destroy.
                     skipped_kernels += 1
 
-        # Kernels without agents will be handled by retry/timeout mechanism
+        # A kernel without an agent has nothing to destroy. The TERMINATE handler
+        # cancels the PENDING ones (cancel_unplaced_kernels) so that the session
+        # can reach TERMINATED.
         if skipped_kernels > 0:
-            log.info(
-                "Found {} kernels without agents, will be handled by retry/timeout",
+            log.debug(
+                "Found {} kernels without agents; no destroy request is sent for them",
                 skipped_kernels,
             )
 
@@ -156,6 +160,47 @@ class SessionTerminator:
             for session in terminating_sessions
             if session.session_id not in failed_session_ids
         ]
+
+    async def cancel_unplaced_kernels(
+        self,
+        terminating_sessions: list[TerminatingSessionData],
+    ) -> list[KernelId]:
+        """
+        Cancel the PENDING kernels of TERMINATING sessions that have no agent.
+
+        Such a kernel was never placed, so no agent will ever report it gone,
+        and its session could never leave TERMINATING. Cancelling it frees its
+        allocation rows; once every kernel is terminal, CHECK_TERMINATING_PROGRESS
+        moves the session to TERMINATED, so it is requested here.
+
+        Each cancel is a guarded update: a kernel that moved on in the meantime
+        is left as it is.
+
+        The session's termination reason is recorded on each cancelled kernel.
+
+        :param terminating_sessions: Sessions to look at; only TERMINATING ones are used
+        :return: IDs of the kernels cancelled
+        """
+        cancelled: list[KernelId] = []
+        for session in terminating_sessions:
+            if session.status != SessionStatus.TERMINATING:
+                continue
+            for kernel in session.kernels:
+                if kernel.agent_id is not None or kernel.status != KernelStatus.PENDING:
+                    continue
+                if await self._repository.update_kernel_status_cancelled(
+                    kernel.kernel_id, session.status_info
+                ):
+                    cancelled.append(kernel.kernel_id)
+        if cancelled:
+            log.info(
+                "Cancelled {} unplaced PENDING kernels of terminating sessions",
+                len(cancelled),
+            )
+            await self._valkey_schedule.mark_schedules_needed_batch([
+                ScheduleType.CHECK_TERMINATING_PROGRESS.value
+            ])
+        return cancelled
 
     async def destroy_kernel(
         self,

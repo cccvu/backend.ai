@@ -101,8 +101,10 @@ class TerminateSessionsLifecycleHandler(SessionLifecycleHandler):
         The coordinator provides SessionWithKernels data.
         This handler:
         1. Fetches detailed session data (TerminatingSessionData) from repository
-        2. Delegates to Terminator's handler-specific method
-        3. Returns empty result (no status transitions needed)
+        2. Cancels the PENDING kernels that were never placed on an agent, since
+           no agent will report them gone
+        3. Delegates to Terminator's handler-specific method
+        4. Returns empty result (no status transitions needed)
         """
         result = SessionExecutionResult()
 
@@ -117,6 +119,10 @@ class TerminateSessionsLifecycleHandler(SessionLifecycleHandler):
 
         if not terminating_sessions:
             return result
+
+        # Unplaced PENDING kernels have no agent to report them gone; cancel them
+        # so that CHECK_TERMINATING_PROGRESS can finish their sessions.
+        await self._terminator.cancel_unplaced_kernels(terminating_sessions)
 
         # Delegate to Terminator's handler-specific method
         await self._terminator.terminate_sessions_for_handler(terminating_sessions)
