@@ -788,9 +788,10 @@ class TestPromotionRacingDetect:
         session_id, kernel_ids = await scope.session(
             SessionStatus.CREATING, KernelStatus.RUNNING, kernels=2
         )
-        await _set_kernel_status(scope.db, kernel_ids[1], KernelStatus.TERMINATED)
 
         async def detect_meanwhile(session: SessionWithKernels) -> None:
+            # A kernel ends after the promotion read the session.
+            await _set_kernel_status(scope.db, kernel_ids[1], KernelStatus.TERMINATED)
             assert await harness.coordinator.process_lifecycle_schedule(
                 ScheduleType.DETECT_KERNEL_TERMINATION
             )
@@ -806,6 +807,34 @@ class TestPromotionRacingDetect:
         )
 
         running_hook.execute.assert_awaited_once()
+        assert await _session_status(scope.db, session_id) == SessionStatus.TERMINATING
+        assert [to for _, _, to in await _history(scope.db, session_id)] == [
+            str(SessionStatus.TERMINATING)
+        ]
+        assert harness.broadcast_transitions() == [(session_id, str(SessionStatus.TERMINATING))]
+
+    @pytest.mark.parametrize("ended", [KernelStatus.TERMINATED, KernelStatus.CANCELLED])
+    async def test_a_session_with_an_ended_kernel_is_left_to_detect(
+        self, scope: _Scope, ended: KernelStatus
+    ) -> None:
+        """A create the agent failed ends the session's only kernel while the
+        session is CREATING: promote-to-running must not move it to RUNNING (nor
+        run the RUNNING hook); DETECT_KERNEL_TERMINATION moves it to TERMINATING."""
+        harness = _build_harness(scope.db)
+        session_id, _ = await scope.session(SessionStatus.CREATING, ended)
+        running_hook = MagicMock()
+        running_hook.execute = AsyncMock()
+        harness.hook_registry.get_hook.side_effect = lambda status: (
+            running_hook if status == SessionStatus.RUNNING else None
+        )
+
+        await harness.coordinator.process_lifecycle_schedule(ScheduleType.CHECK_CREATING_PROGRESS)
+
+        running_hook.execute.assert_not_awaited()
+        assert await _session_status(scope.db, session_id) == SessionStatus.CREATING
+        assert await harness.coordinator.process_lifecycle_schedule(
+            ScheduleType.DETECT_KERNEL_TERMINATION
+        )
         assert await _session_status(scope.db, session_id) == SessionStatus.TERMINATING
         assert [to for _, _, to in await _history(scope.db, session_id)] == [
             str(SessionStatus.TERMINATING)

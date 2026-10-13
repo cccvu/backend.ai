@@ -298,12 +298,19 @@ def _create_promotion_specs() -> Mapping[ScheduleType, PromotionSpec]:
             success_status=SessionStatus.PREPARED,
             reason="triggered-by-scheduler",
         ),
-        # Promote to RUNNING when no kernel is in pre-running states
-        # (allows partial failure - some kernels may be TERMINATED)
+        # Promote to RUNNING when no kernel is in pre-running states and none has
+        # ended. A session with a TERMINATED or CANCELLED kernel is left to
+        # DETECT_KERNEL_TERMINATION, which moves it to TERMINATING; promoting it
+        # first would run the RUNNING hook and broadcast for a session whose kernel
+        # never ran (a create the agent failed, for one).
         ScheduleType.CHECK_CREATING_PROGRESS: PromotionSpec(
             name="promote-to-running",
             target_statuses=[SessionStatus.CREATING],
-            target_kernel_statuses=list(KernelStatus.pre_running_statuses()),
+            target_kernel_statuses=[
+                *KernelStatus.pre_running_statuses(),
+                KernelStatus.TERMINATED,
+                KernelStatus.CANCELLED,
+            ],
             kernel_match_type=KernelMatchType.NOT_ANY,
             success_status=SessionStatus.RUNNING,
             reason="triggered-by-scheduler",
