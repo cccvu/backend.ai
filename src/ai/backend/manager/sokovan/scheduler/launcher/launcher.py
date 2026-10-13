@@ -117,7 +117,9 @@ class SessionLauncher:
     Orchestrates:
     1. Prepare: SCHEDULED -> PREPARING (image pulling)
     2. Start: PREPARED -> CREATING (kernel creation)
-    3. Retry operations for stuck sessions
+
+    It does not retry or expire stuck sessions: the EXPIRE_STUCK_STARTS maintenance handler
+    ends a session stuck in a starting status past its bound.
     """
 
     _repository: SchedulerRepository
@@ -554,8 +556,9 @@ class SessionLauncher:
             # Convert exception to error status info
             error_info = convert_to_status_data(e, self._config_provider.config.debug.enabled)
             log.warning(log_fmt + "failed-starting", *log_args, exc_info=True)
-            # Update error info in status_data without changing status
-            # Session will be handled by timeout detection in Coordinator
+            # Update error info in status_data without changing status.
+            # The session stays in CREATING until the stuck-start expiry
+            # (EXPIRE_STUCK_STARTS) moves it to TERMINATING.
             await self._repository.update_session_error_info(session.session_id, error_info)
 
     async def _finish_kernel_creation(

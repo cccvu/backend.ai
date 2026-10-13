@@ -9,7 +9,7 @@ Scheduler is the core module responsible for session scheduling in Backend.AI, a
 **Key Responsibilities:**
 - **Session Scheduling**: Allocates waiting sessions to available agents
 - **Resource Constraint Validation**: Verifies that requested resources satisfy system constraints
-- **Lifecycle Management**: Handles session start, termination, and timeout detection
+- **Lifecycle Management**: Handles session start and termination, and expires sessions stuck while starting
 - **State Transition Management**: Tracks kernel state transitions (SCHEDULED → PREPARING → PULLING → PREPARED → CREATING → RUNNING → TERMINATING → TERMINATED)
 
 ## Architecture
@@ -137,7 +137,7 @@ Process kernel lifecycle events.
 
 ### Scheduler
 
-Scheduler is the engine that executes actual scheduling algorithms, responsible for querying pending sessions and allocating them to available agents. It provides an extensible scheduling mechanism through a plugin system, designed to flexibly change scheduling policies or algorithms. It performs session start and termination processing, confirms progress during image pulling or kernel creation, and handles timeout detection via Coordinator's failure classification.
+Scheduler is the engine that executes actual scheduling algorithms, responsible for querying pending sessions and allocating them to available agents. It provides an extensible scheduling mechanism through a plugin system, designed to flexibly change scheduling policies or algorithms. It performs session start and termination processing, confirms progress during image pulling or kernel creation. Sessions stuck while starting are expired by the EXPIRE_STUCK_STARTS maintenance handler (see Timeout Policies under [State Transition Details](#state-transition-details)).
 
 **Key Plugins and Dependencies:**
 - **SessionValidator**: Validates whether resources satisfy system constraints (user/group/domain quotas, concurrent execution limits, etc.)
@@ -296,7 +296,7 @@ sequenceDiagram
             alt Image check/pull started
                 Agent-->>Sched: Image pulling triggered
             else RPC failure
-                Note over Sched: Record error, timeout will detect
+                Note over Sched: Log error; CHECK_PRECONDITION re-triggers the pull, EXPIRE_STUCK_STARTS ends a session stuck past its bound
             end
         end
     end
@@ -322,9 +322,6 @@ sequenceDiagram
     DB-->>Repo: Session list
     Repo-->>Sched: prepared_sessions
 
-    Sched->>Repo: update_sessions_to_creating()
-    Repo->>DB: UPDATE sessions SET status=CREATING
-
     loop For each session (concurrent processing)
         Sched->>Sched: _start_single_session(session)
 
@@ -335,21 +332,24 @@ sequenceDiagram
         Note over Sched: Build kernel creation config
         Sched->>Sched: build_kernel_creation_config()
 
-        loop For each kernel in session
-            Sched->>Agent: create_kernel(kernel_config)
+        loop For each agent of the session (background task)
+            Sched->>Agent: create_kernels(kernel_configs)
 
             Note over Agent: Container creation
             Note over Agent: Image already pulled in PREPARING stage
 
             alt RPC success
                 Agent-->>Sched: Creation start confirmation
-            else RPC failure
-                Note over Sched: Record error, timeout detection will terminate
+            else RPC failure or no reply
+                Note over Sched: Record failed agent; EXPIRE_STUCK_STARTS ends the session past its bound
             end
         end
+        Note over Sched: The pass waits only until every request is handed off
     end
 
     Sched-->>Coord: Start complete
+    Coord->>Repo: update_with_history()
+    Repo->>DB: UPDATE sessions SET status=CREATING
 ```
 
 **Step-by-Step Explanation:**
@@ -672,6 +672,9 @@ Handlers for cleanup and maintenance operations.
 #### SweepSessionsHandler
 Cleans up old sessions. Queries long-waiting sessions and cancels or cleans sessions according to configured policy. This removes sessions that occupy resources but aren't actually being used.
 
+#### ExpireStuckStartsLifecycleHandler
+Moves sessions stuck while starting (SCHEDULED, PREPARING, PULLING, PREPARED, CREATING) to TERMINATING once they are past their bound (see Timeout Policies). It runs on the long cycle only (every 60 s, first 300 s after a manager start, so event backlogs drain first) and takes no lock: a transition moves only sessions still in the status they were read in.
+
 ### Kernel Handlers (`handlers/kernel/`)
 
 Handlers for kernel-level operations that operate independently of session lifecycle.
@@ -755,11 +758,11 @@ CANCELLED
 | Current State | Next State | Transition Trigger | Responsible Component | Failure Handling |
 |----------|----------|------------|--------------|------------|
 | PENDING | SCHEDULED | Scheduling success, agent allocation complete | Scheduler | CANCELLED (validation failure) |
-| PENDING | CANCELLED | User cancellation request, timeout | ScheduleCoordinator | - |
-| SCHEDULED | PREPARING | Precondition check started, image pull triggered | Scheduler | ERROR (RPC failure) |
-| PREPARING | PREPARED | All images pulled and ready | Scheduler | CANCELLED (pulling failure) |
-| PREPARED | CREATING | Kernel creation RPC started | Scheduler | ERROR (RPC failure) |
-| CREATING | RUNNING | All kernels in RUNNING state | KernelStateEngine | TERMINATING (partial failure) |
+| PENDING | CANCELLED | User cancellation request | ScheduleCoordinator | - |
+| SCHEDULED | PREPARING | Precondition check started, image pull triggered | Scheduler | Pull re-triggered each pass; TERMINATING past the start bound |
+| PREPARING | PREPARED | All images pulled and ready | Scheduler | CANCELLED (pulling failure); TERMINATING past the start bound |
+| PREPARED | CREATING | Kernel creation RPC started | Scheduler | TERMINATING past the start bound |
+| CREATING | RUNNING | All kernels in RUNNING state | KernelStateEngine | TERMINATING (partial failure, or past the start bound) |
 | RUNNING | TERMINATING | Termination request received | Scheduler | - |
 | TERMINATING | TERMINATED | All kernels TERMINATED | KernelStateEngine | - |
 
@@ -784,10 +787,10 @@ CANCELLED
 | Current State | Next State | Transition Trigger | Responsible Component | Failure Handling |
 |----------|----------|------------|--------------|------------|
 | SCHEDULED | PREPARING | Session scheduled, kernel allocated | Scheduler | - |
-| PREPARING | PULLING | Image pull RPC triggered | Scheduler | TERMINATING on timeout |
-| PULLING | PREPARED | Image pulling complete | Agent → Event | TERMINATING on timeout |
-| PREPARED | CREATING | Kernel creation RPC started | Scheduler | TERMINATING on timeout |
-| CREATING | RUNNING | Container created and started | Agent → Event | TERMINATING on timeout |
+| PREPARING | PULLING | Image pull RPC triggered | Scheduler | Session expiry (see Timeout Policies) |
+| PULLING | PREPARED | Image pulling complete | Agent → Event | Session expiry (see Timeout Policies) |
+| PREPARED | CREATING | Kernel creation RPC started | Scheduler | Session expiry (see Timeout Policies) |
+| CREATING | RUNNING | Container created and started | Agent → Event | Session expiry (see Timeout Policies) |
 | SCHEDULED | CANCELLED | Cancellation request before image pull | KernelStateEngine | - |
 | PREPARING | CANCELLED | Cancellation request during image pull trigger | KernelStateEngine | - |
 | PULLING | CANCELLED | Cancellation request during image pulling | KernelStateEngine | - |
@@ -798,13 +801,26 @@ CANCELLED
 
 **Timeout Policies:**
 
-Coordinator's `_classify_failures` detects stuck sessions based on timeout thresholds:
+Agents report a start's progress through events, and some failures report nothing (an agent that
+drops a request, a create that fails before its first event, a session never dispatched). The
+EXPIRE_STUCK_STARTS maintenance handler (`ExpireStuckStartsLifecycleHandler`) moves a session to
+TERMINATING once its age in its current status, taken from its `status_history` on the database
+clock, is past the bound below. Its `status_info` becomes `bootstrap-timeout`, which TERMINATE
+sends to the agents as the destroy reason; the expiry logs a WARNING naming the session, status,
+age and agents.
 
-| Status | Timeout | Action on Timeout |
+| Session status | Bound | Expires when |
 |--------|---------|-------------------|
-| PREPARING | 15 minutes | Transition to TERMINATING |
-| PULLING | 15 minutes | Transition to TERMINATING |
-| CREATING | 10 minutes | Transition to TERMINATING |
+| SCHEDULED, PREPARED | `SESSION_CREATING_EXPIRY_SEC` (15 minutes) | always, past the bound |
+| CREATING | `SESSION_CREATING_EXPIRY_SEC` (15 minutes) | some kernel has not started yet |
+| PREPARING, PULLING | `SESSION_PULLING_EXPIRY_SEC` (2 h 15 min) while some kernel is PULLING, else `SESSION_CREATING_EXPIRY_SEC` | some kernel has not finished preparing |
+
+`SESSION_CREATING_EXPIRY_SEC` is `AGENT_CREATE_KERNELS_TIMEOUT_SEC` plus 5 minutes, so a
+`create_kernels` call in flight gets its full time; `SESSION_PULLING_EXPIRY_SEC` is above the
+agent's default image pull timeout (2 hours). A CREATING session whose kernels have all started,
+and a PREPARING session whose kernels are all prepared, are left to their promotion.
+
+Agent RPCs the scheduler awaits are bounded by the `AGENT_*_TIMEOUT_SEC` constants in `defs.py`.
 
 **PENDING scheduling failure** (max retries exceeded):
 - Sessions exceeding max scheduling retries (SERVICE_MAX_RETRIES) are deprioritized
@@ -852,13 +868,13 @@ Coordinator's `_classify_failures` detects stuck sessions based on timeout thres
 **Resolution**:
 1. Verify image registry connection
 2. Free agent disk space
-3. Session will be terminated after timeout (15 minutes) - user can retry
+3. The session is terminated once past its bound (2 h 15 min while a kernel is pulling, 15 minutes otherwise) - user can retry
 
 ### 3. Kernel Fails in PREPARING/CREATING
 
 **Symptoms**:
 - Kernel creation fails
-- Session transitions to TERMINATING after timeout
+- Session transitions to TERMINATING with `bootstrap-timeout` once past its bound (15 minutes)
 
 **Causes**:
 - Container image errors
@@ -891,8 +907,8 @@ Coordinator's `_classify_failures` detects stuck sessions based on timeout thres
 - **Agent Connection State**: Check agent connection state and responsiveness
 
 **Resolution**:
-1. Wait for automatic force termination after timeout
-2. Check and recover agent connection state
+1. Check and recover agent connection state: TERMINATE re-sends the destroy request every pass until the agent answers
+2. Force-terminate the session if the agent cannot be recovered
 3. Manually clean up session if necessary
 
 ## Parent Document

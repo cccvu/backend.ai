@@ -451,12 +451,12 @@ CANCELLED     └──────── TERMINATING ────────�
 | Current State | Next State | Transition Trigger | Responsible Component | On Failure |
 |----------|----------|------------|--------------|------------|
 | PENDING | SCHEDULED | Scheduling success (agent allocation complete) | Scheduler | CANCELLED (on validation failure) |
-| PENDING | CANCELLED | User cancellation request or pending timeout exceeded | API/Handler | - |
-| SCHEDULED | PREPARED | Image preparation complete | Scheduler | TERMINATING (on preparation failure) |
+| PENDING | CANCELLED | User cancellation request | API/Handler | - |
+| SCHEDULED | PREPARED | Image preparation complete | Scheduler | TERMINATING (on preparation failure, or past the start bound) |
 | SCHEDULED | TERMINATING | User termination request or system policy | API/Scheduler | - |
-| PREPARED | CREATING | Kernel creation RPC call success | Scheduler | TERMINATING (on RPC failure) |
+| PREPARED | CREATING | Kernel creation RPC call success | Scheduler | TERMINATING (past the start bound) |
 | PREPARED | TERMINATING | User termination request or system policy | API/Scheduler | - |
-| CREATING | RUNNING | `kernel_started` event received (all kernels) | ScheduleCoordinator | TERMINATING (on kernel creation failure) |
+| CREATING | RUNNING | `kernel_started` event received (all kernels) | ScheduleCoordinator | TERMINATING (on kernel creation failure, or past the start bound) |
 | CREATING | TERMINATING | User termination request or system policy | API/Scheduler | - |
 | RUNNING | TERMINATING | User termination request or system policy | API/Scheduler | - |
 | TERMINATING | TERMINATED | All kernel `kernel_terminated` events received | ScheduleCoordinator | TERMINATED (after forced termination) |
@@ -557,7 +557,7 @@ PENDING → PROVISIONING → RUNNING → TERMINATING → TERMINATED
 **Resolution**:
 1. Verify image registry connection
 2. Free up agent disk space
-3. Wait for automatic retry on timeout
+3. The pull is re-triggered every pass; the session is terminated once past its bound (2 h 15 min while a kernel is pulling, 15 minutes otherwise; see the [Scheduler](./scheduler/README.md) timeout policies)
 
 ## Sokovan Component Documentation
 

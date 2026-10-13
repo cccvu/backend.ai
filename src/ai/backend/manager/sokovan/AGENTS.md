@@ -21,3 +21,7 @@
 
 - `status_transitions()` must declare the target lifecycle for each result the coordinator classifies
   (`success`, `need_retry`, `expired`, `give_up`). A result with no target stays in the current status (`coordinator._handle_status_transitions`).
+- A transition moves only rows still in the status they were read in. Guard every status write with
+  the status the handler read (`SessionTransitionInfo.from_status`), and drive history, broadcasts,
+  hooks and follow-up work from the rows that actually moved, never from the rows requested. A
+  handler that takes no lock (for example the stuck-start expiry) relies on this guard.
