@@ -17,6 +17,7 @@ from ai.backend.common.events.event_types.kernel.anycast import (
     KernelStartedAnycastEvent,
     KernelTerminatedAnycastEvent,
 )
+from ai.backend.common.events.event_types.kernel.types import KernelLifecycleEventReason
 from ai.backend.common.events.event_types.schedule.anycast import (
     DoSokovanProcessIfNeededEvent,
     DoSokovanProcessScheduleEvent,
@@ -27,7 +28,7 @@ from ai.backend.common.events.event_types.session.broadcast import (
 from ai.backend.common.events.types import AbstractBroadcastEvent
 from ai.backend.common.identifier.resource_group import ResourceGroupID
 from ai.backend.common.leader.tasks import EventTaskSpec
-from ai.backend.common.types import AccessKey, AgentId, SessionId
+from ai.backend.common.types import AccessKey, AgentId, KernelId, SessionId
 from ai.backend.logging import BraceStyleAdapter
 from ai.backend.manager.config.provider import ManagerConfigProvider
 from ai.backend.manager.data.kernel.types import KernelStatus
@@ -1654,8 +1655,23 @@ class ScheduleCoordinator:
         """Handle kernel creating event through the kernel state engine."""
         return await self._kernel_state_engine.mark_kernel_creating(event.kernel_id, event.reason)
 
-    async def handle_kernel_running(self, event: KernelStartedAnycastEvent) -> bool:
-        """Handle kernel running event through the kernel state engine."""
+    async def handle_kernel_running(
+        self,
+        event: KernelStartedAnycastEvent,
+        *,
+        source: AgentId,
+    ) -> bool:
+        """Handle kernel running event through the kernel state engine.
+
+        A kernel that already reached a terminal status cannot become RUNNING.
+        When its start is reported anyway, by the agent the kernel is placed
+        on, the container it reports would run with nothing left to stop it,
+        so it is destroyed (see :meth:`_destroy_kernel_started_after_termination`).
+
+        Args:
+            event: The kernel started event
+            source: The agent that sent the event
+        """
         # Convert event data to dataclass (always present, may be empty)
         creation_info = KernelCreationInfo.from_dict(dict(event.creation_info))
         result = await self._kernel_state_engine.mark_kernel_running(
@@ -1668,7 +1684,86 @@ class ScheduleCoordinator:
             await self._scheduling_controller.mark_scheduling_needed([
                 ScheduleType.CHECK_CREATING_PROGRESS,
             ])
+        else:
+            await self._destroy_kernel_started_after_termination(event.kernel_id, source)
         return result
+
+    async def _destroy_kernel_started_after_termination(
+        self,
+        kernel_id: KernelId,
+        source: AgentId,
+    ) -> None:
+        """Destroy a kernel whose start was reported after it was terminated.
+
+        The destroy is sent only when all of these hold, so that a late or
+        stray event can never destroy a live kernel:
+
+        - the kernel is in a terminal status;
+        - its session is TERMINATING or terminal (a kernel id is reused for a
+          new placement only while its session is still live);
+        - the kernel has an agent, and the event came from that agent.
+
+        The rows are read first and the database connection is released
+        before the agent is called. The destroy is bounded and never raises.
+        """
+        try:
+            kernel_result = await self._repository.search_kernels_for_handler(
+                BatchQuerier(
+                    pagination=NoPagination(),
+                    conditions=[KernelConditions.by_id(kernel_id)],
+                )
+            )
+            if not kernel_result.items:
+                return
+            kernel = kernel_result.items[0]
+            if kernel.lifecycle.status not in KernelStatus.terminal_statuses():
+                return
+            agent = kernel.resource.agent
+            if not agent or agent != source:
+                return
+            session_id = SessionId(UUID(str(kernel.session.session_id)))
+            session_infos = await self._repository.search_sessions_for_handler(
+                BatchQuerier(
+                    pagination=NoPagination(),
+                    conditions=[SessionConditions.by_ids([session_id])],
+                )
+            )
+            if not session_infos:
+                return
+            session_status = session_infos[0].lifecycle.status
+            if (
+                session_status != SessionStatus.TERMINATING
+                and session_status not in SessionStatus.terminal_statuses()
+            ):
+                return
+            log.warning(
+                "Kernel {} of session {} ({}) was reported started by agent {} after it "
+                "reached {}; destroying it",
+                kernel_id,
+                session_id,
+                session_status,
+                agent,
+                kernel.lifecycle.status,
+            )
+            destroy_result = await self._components.terminator.destroy_kernel(
+                AgentId(agent),
+                kernel_id,
+                session_id,
+                KernelLifecycleEventReason.ALREADY_TERMINATED.value,
+            )
+            if not destroy_result.success:
+                log.warning(
+                    "Could not destroy kernel {} on agent {}: {}",
+                    kernel_id,
+                    agent,
+                    destroy_result.error,
+                )
+        except Exception as e:
+            log.warning(
+                "Failed to check kernel {} reported started after termination: {!r}",
+                kernel_id,
+                e,
+            )
 
     async def handle_kernel_preparing(self, event: KernelPreparingAnycastEvent) -> bool:
         """Handle kernel preparing event through the kernel state engine."""

@@ -157,6 +157,28 @@ class SessionTerminator:
             if session.session_id not in failed_session_ids
         ]
 
+    async def destroy_kernel(
+        self,
+        agent_id: AgentId,
+        kernel_id: KernelId,
+        session_id: SessionId,
+        reason: str,
+    ) -> KernelTerminationResult:
+        """
+        Ask an agent to destroy a single kernel, outside a termination pass.
+
+        Used when a kernel the manager already considers gone turns out to have
+        a container on its agent. The RPC is bounded by
+        AGENT_DESTROY_KERNEL_TIMEOUT_SEC and a failure is returned, not raised.
+
+        :param agent_id: The agent the kernel is placed on
+        :param kernel_id: The kernel ID to destroy
+        :param session_id: The session ID that owns the kernel
+        :param reason: The reason for the destroy
+        :return: KernelTerminationResult with success status
+        """
+        return await self._terminate_kernel(agent_id, kernel_id, session_id, reason, ResourceSlot())
+
     async def _terminate_kernel(
         self,
         agent_id: AgentId,

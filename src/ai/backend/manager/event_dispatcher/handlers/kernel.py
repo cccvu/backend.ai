@@ -222,7 +222,7 @@ class KernelEventHandler:
     async def handle_kernel_started(
         self,
         _context: None,
-        _source: AgentId,
+        source: AgentId,
         event: KernelStartedAnycastEvent,
     ) -> None:
         log.info(
@@ -231,7 +231,7 @@ class KernelEventHandler:
             event.kernel_id,
         )
 
-        await self._schedule_coordinator.handle_kernel_running(event)
+        await self._schedule_coordinator.handle_kernel_running(event, source=source)
 
     async def handle_kernel_cancelled(
         self,
