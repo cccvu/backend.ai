@@ -125,14 +125,16 @@ START_SESSION_TIMEOUT_SEC: Final[float] = 60 * 30  # 30 min
 # How long starting a session waits for its create_kernels requests to be handed off.
 # It bounds the agent client pool's acquire, which may connect to an agent it has not reached
 # yet, and never waits for a create_kernels reply. A request not handed off in time is still
-# sent once acquired, unless the manager stops first: then the session stays in CREATING.
+# sent once acquired, unless the manager stops first: then the session stays in CREATING until
+# the stuck-start expiry (SESSION_CREATING_EXPIRY_SEC) ends it.
 KERNEL_CREATION_HANDOFF_TIMEOUT_SEC: Final[float] = 10
 
 # Upper bounds for agent RPCs awaited by the sokovan scheduler.
 # The scheduler holds a global lock while it awaits most of these calls, so an agent that accepts
 # a call and never replies must not stall scheduling for every other agent.
 # create_kernels is the exception: a background task awaits it, outside the lock.
-# On timeout the agent keeps working on the request; its events drive the state.
+# On timeout the agent keeps working on the request; its events drive the state. A session that
+# no event advances is ended by the stuck-start expiry (SESSION_*_EXPIRY_SEC below).
 
 # The agent-side lookup is in memory.
 AGENT_CHECK_RUNNING_TIMEOUT_SEC: Final[float] = 10
@@ -149,6 +151,17 @@ AGENT_NETWORK_RPC_TIMEOUT_SEC: Final[float] = 60
 AGENT_ASSIGN_PORT_TIMEOUT_SEC: Final[float] = 10
 # The agent schedules the batch task and returns.
 AGENT_TRIGGER_BATCH_TIMEOUT_SEC: Final[float] = 60
+
+# Bounds for the stuck-start expiry (ExpireStuckStartsLifecycleHandler). A session still in a
+# starting status (SCHEDULED, PREPARING, PULLING, PREPARED, CREATING) past its bound, measured from
+# its entry into that status on the database clock, is moved to TERMINATING. Nothing else ends a
+# session whose agent failed silently or that was never dispatched.
+# Longer than AGENT_CREATE_KERNELS_TIMEOUT_SEC, so a create_kernels call in flight gets its full
+# time before its session expires.
+SESSION_CREATING_EXPIRY_SEC: Final[float] = AGENT_CREATE_KERNELS_TIMEOUT_SEC + 60 * 5  # 15 min
+# Applies instead while some kernel of a PREPARING or PULLING session is PULLING. Longer than the
+# agent's default image pull timeout (`pull-timeout`, 2 h).
+SESSION_PULLING_EXPIRY_SEC: Final[float] = 60 * 135  # 2 h 15 min
 
 
 DEFAULT_METRIC_RANGE_VECTOR_TIMEWINDOW: Final[str] = "5m"

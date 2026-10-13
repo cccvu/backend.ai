@@ -599,6 +599,12 @@ def kernel_without_agent() -> KernelInfo:
     )
 
 
+@pytest.fixture
+def session_factory() -> Callable[..., SessionWithKernels]:
+    """Factory for SessionWithKernels with the defaults of the fixtures above."""
+    return _create_session
+
+
 # =============================================================================
 # Mock Response Fixtures (factories for creating mock responses from sessions)
 # =============================================================================

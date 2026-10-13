@@ -1358,7 +1358,11 @@ class ScheduleCoordinator:
                 spec=SessionStatusBatchUpdaterSpec(
                     to_status=transition.session,
                     status_changed_at=status_changed_at,
-                    reason="" if transition.session == SessionStatus.RUNNING else None,
+                    reason=(
+                        transition.status_info
+                        if transition.status_info is not None
+                        else ("" if transition.session == SessionStatus.RUNNING else None)
+                    ),
                 ),
                 conditions=[
                     SessionConditions.by_ids(session_ids),
@@ -1962,6 +1966,14 @@ class ScheduleCoordinator:
                 short_interval=2.0,
                 long_interval=60.0,
                 initial_delay=30.0,
+            ),
+            # Expire sessions stuck while starting - maintenance task, long cycle only.
+            # The initial delay lets event backlogs drain after a manager restart.
+            SchedulerTaskSpec(
+                ScheduleType.EXPIRE_STUCK_STARTS,
+                short_interval=None,
+                long_interval=60.0,
+                initial_delay=300.0,
             ),
         ]
 

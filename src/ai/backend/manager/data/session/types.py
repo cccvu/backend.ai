@@ -366,10 +366,13 @@ class TransitionStatus:
     Attributes:
         session: Target session status, None means no change
         kernel: Target kernel status, None means no change
+        status_info: Written to the session's ``status_info`` with the session status,
+            None keeps the default (cleared on RUNNING, unchanged otherwise)
     """
 
     session: SessionStatus | None = None
     kernel: KernelStatus | None = None
+    status_info: str | None = None
 
 
 @dataclass(frozen=True)
