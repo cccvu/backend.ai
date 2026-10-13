@@ -203,8 +203,21 @@ class SessionLauncher:
             for kernel in session.kernels:
                 agent_id = kernel.agent_id
                 if agent_id and kernel.image_id is not None:
-                    # Image config must exist since we queried based on kernels
-                    img_cfg = image_configs[kernel.image_id]
+                    img_cfg = image_configs.get(kernel.image_id)
+                    if img_cfg is None:
+                        # The image row is gone (e.g. deleted after the session was
+                        # scheduled). Skip the kernel so the rest of the group still pulls;
+                        # its session cannot start and the stuck-start expiry ends it.
+                        log.warning(
+                            "Skipping image pull for kernel {} of session {} on agent {}:"
+                            " image {} (id={}) not found",
+                            kernel.kernel_id,
+                            session.session_id,
+                            agent_id,
+                            kernel.image,
+                            kernel.image_id,
+                        )
+                        continue
 
                     # Convert ImageConfigData to ImageConfig format
                     # Use canonical as key for agent_image_configs to avoid duplicates
