@@ -111,7 +111,8 @@ class StartSessionsLifecycleHandler(SessionLifecycleHandler):
         The coordinator provides SessionWithKernels data.
         This handler:
         1. Extracts session IDs from SessionWithKernels
-        2. Queries Repository for additional data (SessionDataForStart + ImageConfigData)
+        2. Queries Repository for additional data (SessionDataForStart + ImageConfigData),
+           keeping only the sessions that are still PREPARED
         3. Starts kernels on agents via Launcher
         """
         result = SessionExecutionResult()
@@ -123,12 +124,18 @@ class StartSessionsLifecycleHandler(SessionLifecycleHandler):
         session_ids = [s.session_info.identity.id for s in sessions]
 
         # Query Repository for additional data needed by Launcher
-        # Use search_sessions_with_kernels_and_user to get user info for session start
+        # Use search_sessions_with_kernels_and_user to get user info for session start.
+        # A session that left PREPARED since the coordinator read it (for example,
+        # one being terminated) is neither started nor reported.
         querier = BatchQuerier(
             pagination=NoPagination(),
-            conditions=[SessionConditions.by_ids(session_ids)],
+            conditions=[
+                SessionConditions.by_ids(session_ids),
+                SessionConditions.by_statuses([SessionStatus.PREPARED]),
+            ],
         )
         sessions_data = await self._repository.search_sessions_with_kernels_and_user(querier)
+        started_ids = {session.session_id for session in sessions_data.sessions}
 
         # Start kernels on agents via Launcher
         # Note: RecorderContext is handled inside Launcher
@@ -137,9 +144,11 @@ class StartSessionsLifecycleHandler(SessionLifecycleHandler):
             sessions_data.image_configs,
         )
 
-        # Mark all sessions as success for status transition
+        # Mark the started sessions as success for status transition
         for session in sessions:
             session_info = session.session_info
+            if session_info.identity.id not in started_ids:
+                continue
             result.successes.append(
                 SessionTransitionInfo(
                     session_id=session_info.identity.id,
