@@ -13,17 +13,31 @@ if TYPE_CHECKING:
 
 
 class PgAdvisoryLock(AbstractDistributedLock):
+    """A PostgreSQL session-level advisory lock.
+
+    With ``blocking=False``, entering raises ``LockNotAcquired`` instead of
+    waiting when another holder has the lock.
+    """
+
     _lock_ctx: AbstractAsyncContextManager[None] | None
 
-    def __init__(self, db: ExtendedAsyncSAEngine, lock_id: LockID) -> None:
+    def __init__(
+        self,
+        db: ExtendedAsyncSAEngine,
+        lock_id: LockID,
+        *,
+        blocking: bool = True,
+    ) -> None:
         self.db = db
         self.lock_id = lock_id
+        self.blocking = blocking
         self._lock_ctx = None
 
     @override
     async def __aenter__(self) -> Any:
-        self._lock_ctx = self.db.advisory_lock(self.lock_id)
-        await self._lock_ctx.__aenter__()
+        lock_ctx = self.db.advisory_lock(self.lock_id, blocking=self.blocking)
+        await lock_ctx.__aenter__()
+        self._lock_ctx = lock_ctx
 
     @override
     async def __aexit__(self, *exc_info: Any) -> bool | None:

@@ -7,11 +7,14 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from ai.backend.common.lock import EtcdLock, FileLock, RedisLock
+from ai.backend.manager.defs import LockID
 from ai.backend.manager.dependencies.domain.distributed_lock import (
     DistributedLockFactoryDependency,
     DistributedLockInput,
     create_lock_factory,
 )
+from ai.backend.manager.pglock import PgAdvisoryLock
 
 
 @dataclass
@@ -96,6 +99,41 @@ class TestCreateLockFactory:
 
         factory = create_lock_factory(config_provider, db, etcd)  # type: ignore[arg-type]
         assert callable(factory)
+
+    def test_pg_advisory_backend_passes_blocking_through(self) -> None:
+        config_provider = _make_config_provider("pg_advisory")
+        db = MagicMock()
+
+        factory = create_lock_factory(config_provider, db, MagicMock())  # type: ignore[arg-type]
+        default_lock = factory(LockID.LOCKID_TEST, 10.0)
+        blocking_lock = factory(LockID.LOCKID_TEST, 10.0, blocking=True)
+        non_blocking_lock = factory(LockID.LOCKID_TEST, 10.0, blocking=False)
+
+        for lock in (default_lock, blocking_lock, non_blocking_lock):
+            assert isinstance(lock, PgAdvisoryLock)
+            assert lock.db is db
+            assert lock.lock_id == LockID.LOCKID_TEST
+        assert isinstance(default_lock, PgAdvisoryLock)
+        assert default_lock.blocking is True
+        assert isinstance(blocking_lock, PgAdvisoryLock)
+        assert blocking_lock.blocking is True
+        assert isinstance(non_blocking_lock, PgAdvisoryLock)
+        assert non_blocking_lock.blocking is False
+
+    @patch("ai.backend.manager.dependencies.domain.distributed_lock.redis_helper")
+    @pytest.mark.parametrize(
+        ("lock_backend", "lock_type"),
+        [("filelock", FileLock), ("redlock", RedisLock), ("etcd", EtcdLock)],
+    )
+    def test_other_backends_accept_and_ignore_blocking(
+        self, mock_redis_helper: MagicMock, lock_backend: str, lock_type: type
+    ) -> None:
+        config_provider = _make_config_provider(lock_backend)
+        config_provider.config.redis.to_redis_profile_target = MagicMock()  # type: ignore[attr-defined]
+
+        factory = create_lock_factory(config_provider, MagicMock(), MagicMock())  # type: ignore[arg-type]
+        for blocking in (True, False):
+            assert isinstance(factory(LockID.LOCKID_TEST, 10.0, blocking=blocking), lock_type)
 
     def test_invalid_backend_raises_error(self) -> None:
         """Should raise ValueError for unknown backends."""

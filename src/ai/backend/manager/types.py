@@ -51,7 +51,20 @@ class UserScope:
 
 
 class DistributedLockFactory(Protocol):
-    def __call__(self, lock_id: LockID, lifetime_hint: float) -> AbstractDistributedLock: ...
+    def __call__(
+        self,
+        lock_id: LockID,
+        lifetime_hint: float,
+        *,
+        blocking: bool = True,
+    ) -> AbstractDistributedLock:
+        """Create a lock for ``lock_id``.
+
+        With ``blocking=False``, a backend that supports it raises
+        ``LockNotAcquired`` on entry instead of waiting while another holder
+        has the lock. Backends without a non-blocking mode ignore the flag.
+        """
+        ...
 
 
 class MountOptionModel(BackendAISchema):

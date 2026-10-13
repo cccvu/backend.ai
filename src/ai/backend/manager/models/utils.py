@@ -5,6 +5,7 @@ import logging
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import AbstractAsyncContextManager as AbstractAsyncCtxMgr
 from contextlib import asynccontextmanager as actxmgr
+from contextlib import suppress
 from typing import (
     Any,
     Concatenate,
@@ -34,7 +35,7 @@ from tenacity import (
 from ai.backend.common.exception import DatabaseError
 from ai.backend.logging import BraceStyleAdapter
 from ai.backend.manager.defs import LockID
-from ai.backend.manager.errors.resource import DBOperationFailed
+from ai.backend.manager.errors.resource import DBOperationFailed, LockNotAcquired
 from ai.backend.manager.types import Sentinel
 
 log = BraceStyleAdapter(logging.getLogger(__spec__.name))
@@ -56,6 +57,9 @@ class ExtendedAsyncSAEngine(SAEngine):
         super().__init__(*args, **kwargs)
         self._readonly_txn_count = 0
         self._generic_txn_count = 0
+        # Advisory lock ids this engine holds or is acquiring, so that a
+        # non-blocking attempt in the same process skips without a connection.
+        self._held_advisory_locks: set[int] = set()
         self._sess_factory = async_sessionmaker(self, expire_on_commit=False)
         self._readonly_sess_factory = async_sessionmaker(self)
 
@@ -271,41 +275,99 @@ class ExtendedAsyncSAEngine(SAEngine):
                 yield session
 
     @actxmgr
-    async def advisory_lock(self, lock_id: LockID) -> AsyncIterator[None]:
-        lock_acquired = False
-        # Here we use the session-level advisory lock,
-        # which follows the lifetime of underlying DB connection.
-        # As such, we should keep using one single connection for both lock and unlock ops.
-        async with self.connect() as lock_conn:
+    async def advisory_lock(self, lock_id: LockID, *, blocking: bool = True) -> AsyncIterator[None]:
+        """Hold a PostgreSQL session-level advisory lock for the body.
+
+        With ``blocking=True`` (the default) this waits until the lock is
+        granted. With ``blocking=False`` it raises ``LockNotAcquired`` at once
+        when the lock is held elsewhere, including by another holder in this
+        process (which is detected without checking out a connection).
+
+        The lock connection runs in AUTOCOMMIT mode, so it never sits idle in a
+        transaction while the body runs: a server-side
+        ``idle_in_transaction_session_timeout`` would otherwise end the session,
+        and the lock with it, partway through the body.
+        """
+        # The check and the add happen before the first await, so concurrent
+        # callers in this process see each other. Only the adder removes the id.
+        held = self._held_advisory_locks
+        if lock_id in held:
+            if not blocking:
+                raise LockNotAcquired(f"advisory lock {lock_id:d} is held in this process")
+            added = False
+        else:
+            held.add(lock_id)
+            added = True
+        try:
+            # Here we use the session-level advisory lock,
+            # which follows the lifetime of underlying DB connection.
+            # As such, we should keep using one single connection for both lock and unlock ops.
+            async with self.connect() as lock_conn:
+                # Set before the first statement; the pool resets it on checkin.
+                await lock_conn.execution_options(isolation_level="AUTOCOMMIT")
+                lock_acquired = False
+                try:
+                    async with asyncio.timeout(self.lock_conn_timeout):
+                        await self._acquire_advisory_lock(lock_conn, lock_id, blocking)
+                        lock_acquired = True
+                        yield
+                finally:
+                    if lock_acquired:
+                        await self._release_advisory_lock(lock_conn, lock_id)
+        finally:
+            if added:
+                held.discard(lock_id)
+
+    @staticmethod
+    async def _acquire_advisory_lock(
+        lock_conn: SAConnection,
+        lock_id: LockID,
+        blocking: bool,
+    ) -> None:
+        # It is usually a BAD practice to directly interpolate strings into SQL statements,
+        # but in this case:
+        #  - The lock ID is only given from trusted codes.
+        #  - asyncpg does not support parameter interpolation with raw SQL statements.
+        try:
+            if blocking:
+                await lock_conn.exec_driver_sql(f"SELECT pg_advisory_lock({lock_id:d});")
+                return
+            result = await lock_conn.exec_driver_sql(f"SELECT pg_try_advisory_lock({lock_id:d});")
+        except sa.exc.DBAPIError as e:
+            if getattr(e.orig, "pgcode", None) == "55P03":  # lock not available error
+                # This may happen upon shutdown after some time.
+                raise asyncio.CancelledError() from e
+            raise
+        if result.scalar() is not True:
+            raise LockNotAcquired(f"advisory lock {lock_id:d} is held by another session")
+
+    @staticmethod
+    async def _release_advisory_lock(lock_conn: SAConnection, lock_id: LockID) -> None:
+        """Release the lock, or drop the connection when it cannot be confirmed.
+
+        Never raises an ``Exception``, so it does not mask the body's exception.
+        """
+        released = False
+        if not lock_conn.closed and not lock_conn.invalidated:
             try:
-                # It is usually a BAD practice to directly interpolate strings into SQL statements,
-                # but in this case:
-                #  - The lock ID is only given from trusted codes.
-                #  - asyncpg does not support parameter interpolation with raw SQL statements.
-                async with asyncio.timeout(self.lock_conn_timeout):
-                    await lock_conn.exec_driver_sql(
-                        f"SELECT pg_advisory_lock({lock_id:d});",
-                    )
-                    lock_acquired = True
-                    yield
-            except sa.exc.DBAPIError as e:
-                if getattr(e.orig, "pgcode", None) == "55P03":  # lock not available error
-                    # This may happen upon shutdown after some time.
-                    raise asyncio.CancelledError() from e
-                raise e
-            except asyncio.CancelledError:
-                raise
-            finally:
-                if lock_acquired and not lock_conn.closed:
-                    try:
-                        await lock_conn.exec_driver_sql(
-                            f"SELECT pg_advisory_unlock({lock_id:d})",
-                        )
-                    except sa.exc.InterfaceError:
-                        log.warning(
-                            "DB Connection for lock(id: {:d}) has already been closed. Skip unlock",
-                            lock_id,
-                        )
+                result = await lock_conn.exec_driver_sql(f"SELECT pg_advisory_unlock({lock_id:d});")
+                released = result.scalar() is True
+            except Exception as e:
+                log.warning(
+                    "Failed to release the advisory lock (id: {:d}): {!r}",
+                    lock_id,
+                    e,
+                )
+        if released:
+            return
+        log.warning(
+            "The advisory lock (id: {:d}) was not held at release; "
+            "the lock was lost while the body ran.",
+            lock_id,
+        )
+        # Closing the session releases any session-level lock it may still hold.
+        with suppress(Exception):
+            await lock_conn.invalidate()
 
 
 P = ParamSpec("P")
