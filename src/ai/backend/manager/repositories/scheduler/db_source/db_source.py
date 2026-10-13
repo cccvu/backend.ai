@@ -1408,33 +1408,17 @@ class ScheduleDBSource:
         await savepoint.commit()
         return True
 
-    async def _free_kernel_allocations(
-        self,
-        db_sess: SASession,
-        kernel_ids: Sequence[UUID],
-        now: datetime,
-    ) -> None:
-        """Set ``free_at`` on the given kernels' active allocations. Only sets
-        ``free_at`` and does not adjust ``agent_resources.used`` -- callers
-        whose source statuses can include RUNNING/TERMINATING must use
-        ``update_kernel_status_terminated`` instead. Idempotent.
-        """
-        if not kernel_ids:
-            return
-        await db_sess.execute(
-            sa.update(ResourceAllocationRow)
-            .where(
-                ResourceAllocationRow.kernel_id.in_(kernel_ids),
-                ResourceAllocationRow.free_at.is_(None),
-            )
-            .values(free_at=now)
-        )
-
     async def _cancel_pending_sessions(
         self, db_sess: SASession, session_ids: list[SessionId], reason: str, now: datetime
     ) -> list[SessionId]:
         """Cancel PENDING sessions and their kernels, and free the kernels'
         ``resource_allocations`` rows in the same transaction.
+
+        A PENDING session's kernels may already hold a reservation on an agent:
+        the scheduling pass reserves and places kernels before it moves the
+        session to SCHEDULED. The kernels' holds on ``agent_resources`` are
+        released along with their rows, so a cancel that races the scheduling
+        pass leaks nothing.
         """
         # Capture from_statuses before update for history recording
         status_query = sa.select(SessionRow.id, SessionRow.status).where(
@@ -1483,7 +1467,7 @@ class ScheduleDBSource:
                 .returning(KernelRow.id)
             )
             cancelled_kernel_ids = [row.id for row in kernel_update_result]
-            await self._free_kernel_allocations(db_sess, cancelled_kernel_ids, now)
+            await self._free_allocations_and_release(db_sess, cancelled_kernel_ids, now)
 
             # Record scheduling history for cancel transition
             history_specs = [
