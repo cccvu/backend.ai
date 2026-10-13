@@ -1055,3 +1055,34 @@ class TestKernelStartedAfterTermination:
 
         assert accepted is False
         assert harness.agent_pool.destroys == []
+
+
+# =============================================================================
+# START never sends a session again once a kernel is past PREPARED
+# =============================================================================
+
+
+class TestStartSkipsSessionsAlreadySent:
+    async def test_a_partly_started_session_is_skipped_and_stays_prepared(
+        self, scope: _Scope
+    ) -> None:
+        harness = _build_harness(scope.db, lifecycle_handlers=_start_handlers)
+        partial_id, partial_kernels = await scope.session(
+            SessionStatus.PREPARED, KernelStatus.PREPARED, kernels=2
+        )
+        await _set_kernel_status(scope.db, partial_kernels[1], KernelStatus.CREATING)
+        fresh_id, _ = await scope.session(SessionStatus.PREPARED, KernelStatus.PREPARED)
+
+        assert await harness.coordinator.process_lifecycle_schedule(ScheduleType.START)
+
+        assert harness.launcher.started == [[fresh_id]]
+        assert await _session_status(scope.db, partial_id) == SessionStatus.PREPARED
+        assert await _history(scope.db, partial_id) == [
+            ("start-sessions", str(SessionStatus.PREPARED), str(SessionStatus.PREPARED))
+        ]
+        assert [k.status for k in await _kernels(scope.db, partial_id)] == [
+            KernelStatus.PREPARED,
+            KernelStatus.CREATING,
+        ]
+        assert await _session_status(scope.db, fresh_id) == SessionStatus.CREATING
+        assert harness.broadcast_transitions() == [(fresh_id, str(SessionStatus.CREATING))]
