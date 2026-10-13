@@ -231,6 +231,11 @@ def _search_result(sessions: Sequence[_PreparedSession]) -> SessionWithKernelsAn
     )
 
 
+def _moved_session_ids(updater: Any, bulk_creator: Any) -> list[SessionId]:
+    """Every session the update was asked for moves, as a mocked commit."""
+    return [spec.session_id for spec in bulk_creator.specs]
+
+
 def _committed_session_ids(update_with_history: AsyncMock) -> list[set[SessionId]]:
     """Session ids each ``update_with_history`` call moved to CREATING."""
     committed: list[set[SessionId]] = []
@@ -351,7 +356,7 @@ def repository() -> AsyncMock:
     repository.get_all_resource_groups = AsyncMock(return_value=[RESOURCE_GROUP])
     repository.get_last_session_histories = AsyncMock(return_value={})
     repository.get_db_now = AsyncMock(side_effect=lambda: datetime.now(tzutc()))
-    repository.update_with_history = AsyncMock(return_value=1)
+    repository.update_with_history = AsyncMock(side_effect=_moved_session_ids)
     repository.update_session_network_id = AsyncMock(return_value=None)
     repository.update_session_error_info = AsyncMock(return_value=None)
     repository.invalidate_kernel_related_cache = AsyncMock(return_value=None)
@@ -506,9 +511,9 @@ class TestStartLockHold:
         ]
         sent_at_commit: list[tuple[set[KernelId], int]] = []
 
-        async def commit(*args: Any) -> int:
+        async def commit(*args: Any) -> list[SessionId]:
             sent_at_commit.append((set(hung_agent.in_flight), ok_agent.await_count))
-            return 1
+            return _moved_session_ids(*args)
 
         repository.update_with_history.side_effect = commit
         try:
@@ -568,11 +573,11 @@ class TestStartLockHold:
         ]
         in_flight_at_commit: list[set[KernelId]] = []
 
-        async def commit(*args: Any) -> int:
+        async def commit(*args: Any) -> list[SessionId]:
             in_flight_at_commit.append(set(guarded_agent.in_flight))
             if len(in_flight_at_commit) == 1:
                 raise ConnectionError("database unavailable")
-            return 1
+            return _moved_session_ids(*args)
 
         repository.update_with_history.side_effect = commit
         failure_recorded = asyncio.Event()

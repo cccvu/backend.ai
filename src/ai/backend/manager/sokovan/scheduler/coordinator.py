@@ -963,7 +963,7 @@ class ScheduleCoordinator:
         if sessions_to_transition:
             # Create TransitionStatus with kernel=None (promotion doesn't change kernel status)
             transition = TransitionStatus(session=to_status, kernel=None)
-            await self._apply_transition(
+            moved = await self._apply_transition(
                 spec.name,
                 sessions_to_transition,
                 transition,
@@ -972,8 +972,10 @@ class ScheduleCoordinator:
                 current_time,
             )
 
-            # Broadcast events for successful transitions
-            await self._broadcast_transition_events(sessions_to_transition, to_status)
+            # Broadcast events only for the sessions that actually moved
+            await self._broadcast_transition_events(
+                [s for s in sessions_to_transition if s.session_id in moved], to_status
+            )
 
     async def _execute_transition_hooks(
         self,
@@ -987,6 +989,10 @@ class ScheduleCoordinator:
         their full session data (for occupied_slots calculation on RUNNING transition).
 
         All hooks are blocking - if a hook fails, the session won't transition.
+
+        Only the sessions still in the status they were read in are fetched:
+        a session that moved in the meantime (for example, was terminated)
+        gets no hook and no transition.
 
         Args:
             session_infos: Sessions to execute hooks for
@@ -1004,12 +1010,16 @@ class ScheduleCoordinator:
         session_ids = [s.session_id for s in session_infos]
         querier = BatchQuerier(
             pagination=NoPagination(),
-            conditions=[SessionConditions.by_ids(session_ids)],
+            conditions=[
+                SessionConditions.by_expected_statuses({
+                    s.session_id: s.from_status for s in session_infos
+                })
+            ],
         )
         full_sessions = await self._repository.search_sessions_with_kernels_for_handler(querier)
 
         if not full_sessions:
-            log.warning(
+            log.debug(
                 "No full session data found for {} sessions transitioning to {}",
                 len(session_ids),
                 target_status,
@@ -1154,7 +1164,7 @@ class ScheduleCoordinator:
 
         # SUCCESS transitions
         if transitions.success and result.successes:
-            await self._apply_transition(
+            moved = await self._apply_transition(
                 handler_name,
                 result.successes,
                 transitions.success,
@@ -1162,10 +1172,11 @@ class ScheduleCoordinator:
                 records,
                 current_time,
             )
-            # Broadcast events for successful transitions
+            # Broadcast events only for the sessions that actually moved
             if transitions.success.session:
                 await self._broadcast_transition_events(
-                    result.successes, transitions.success.session
+                    [s for s in result.successes if s.session_id in moved],
+                    transitions.success.session,
                 )
 
         # FAILURE transitions - Coordinator classifies failures into give_up/expired/need_retry.
@@ -1313,8 +1324,14 @@ class ScheduleCoordinator:
         scheduling_result: SchedulingResult,
         records: Mapping[SessionId, ExecutionRecord],
         status_changed_at: datetime,
-    ) -> None:
+    ) -> set[SessionId]:
         """Apply a single transition type to sessions (BEP-1030).
+
+        Each session moves only while it is still in the status it was read
+        in (``SessionTransitionInfo.from_status``). A session that moved in
+        the meantime, for example one a user terminated while the handler
+        ran, is left as it is: it gets no history row, and the kernel reset
+        below skips it. Callers broadcast only for the returned sessions.
 
         Args:
             handler_name: Name of the handler for logging and history
@@ -1323,11 +1340,16 @@ class ScheduleCoordinator:
             scheduling_result: Result type for history recording
             records: Mapping of session IDs to their execution records
             status_changed_at: Database timestamp for status change
+
+        Returns:
+            IDs of the sessions that moved. When the transition leaves the
+            session status alone, every given session counts as moved.
         """
         if not session_infos:
-            return
+            return set()
 
         session_ids = [s.session_id for s in session_infos]
+        moved: set[SessionId] = set(session_ids)
 
         # Session status update
         if transition.session:
@@ -1337,7 +1359,12 @@ class ScheduleCoordinator:
                     status_changed_at=status_changed_at,
                     reason="" if transition.session == SessionStatus.RUNNING else None,
                 ),
-                conditions=[SessionConditions.by_ids(session_ids)],
+                conditions=[
+                    SessionConditions.by_ids(session_ids),
+                    SessionConditions.by_expected_statuses({
+                        info.session_id: info.from_status for info in session_infos
+                    }),
+                ],
             )
             history_specs = [
                 SessionSchedulingHistoryCreatorSpec(
@@ -1352,20 +1379,36 @@ class ScheduleCoordinator:
                 )
                 for info in session_infos
             ]
-            updated = await self._repository.update_with_history(
-                updater, BulkCreator(specs=history_specs)
+            moved = set(
+                await self._repository.update_with_history(
+                    updater, BulkCreator(specs=history_specs)
+                )
             )
+            if len(moved) < len(session_ids):
+                log.info(
+                    "{}: {} of {} sessions left the status they were read in; "
+                    "not moving them to {} ({})",
+                    handler_name,
+                    len(session_ids) - len(moved),
+                    len(session_ids),
+                    transition.session,
+                    scheduling_result.value,
+                )
             log.debug(
                 "{}: Updated {} sessions to {} ({})",
                 handler_name,
-                updated,
+                len(moved),
                 transition.session,
                 scheduling_result.value,
             )
 
         # Kernel status reset if transitioning to PENDING
         if transition.kernel == KernelStatus.PENDING:
-            await self._apply_kernel_pending_resets(handler_name, session_ids)
+            await self._apply_kernel_pending_resets(
+                handler_name, [session_id for session_id in session_ids if session_id in moved]
+            )
+
+        return moved
 
     async def _apply_kernel_pending_resets(
         self,

@@ -821,18 +821,23 @@ class SchedulerRepository:
         self,
         updater: BatchUpdater[SessionRow],
         bulk_creator: BulkCreator[SessionSchedulingHistoryRow],
-    ) -> int:
+    ) -> list[SessionId]:
         """Update session statuses and record history in same transaction.
 
         This method combines batch status update with history recording,
         ensuring both operations are atomic within a single transaction.
+        History is recorded only for the sessions that were updated, so a
+        status guard in ``updater.conditions`` (see
+        ``SessionConditions.by_expected_statuses``) acts as a compare-and-set:
+        a session that left its expected status is neither updated nor
+        recorded.
 
         Args:
             updater: BatchUpdater containing spec and conditions for session update
             bulk_creator: BulkCreator containing specs for history records
 
         Returns:
-            Number of sessions updated
+            IDs of the sessions updated
         """
         return await self._db_source.update_with_history(updater, bulk_creator)
 

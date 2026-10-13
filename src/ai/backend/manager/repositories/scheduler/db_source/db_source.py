@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping, Sequence, Set
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -113,7 +113,7 @@ from ai.backend.manager.repositories.base.rbac.entity_creator import (
     execute_rbac_bulk_entity_creator,
     execute_rbac_entity_creator,
 )
-from ai.backend.manager.repositories.base.updater import BatchUpdater, execute_batch_updater
+from ai.backend.manager.repositories.base.updater import BatchUpdater
 from ai.backend.manager.repositories.resource_slot.types import (
     resource_slot_to_quantities,
 )
@@ -4043,7 +4043,7 @@ class ScheduleDBSource:
         self,
         updater: BatchUpdater[SessionRow],
         bulk_creator: BulkCreator[SessionSchedulingHistoryRow],
-    ) -> int:
+    ) -> list[SessionId]:
         """Update session statuses and record history in same transaction.
 
         This method combines batch status update with history recording,
@@ -4051,21 +4051,39 @@ class ScheduleDBSource:
         Uses merge logic to prevent duplicate history records when status
         doesn't change.
 
+        History is recorded only for the sessions the update actually moved,
+        so a session that the conditions rejected (for example, one that left
+        its expected status in the meantime) gets no history row.
+
+        The transaction runs at READ COMMITTED on purpose: when a matching
+        row is locked by a concurrent transaction, PostgreSQL waits for it
+        and re-checks the WHERE clause against the newly committed row, so
+        a status guard in ``updater.conditions`` is a real compare-and-set.
+
         Args:
             updater: BatchUpdater containing spec and conditions for session update
             bulk_creator: BulkCreator containing specs for history records
 
         Returns:
-            Number of sessions updated
+            IDs of the sessions updated
         """
+        session_table = SessionRow.__table__
+        stmt = sa.update(session_table).values(updater.spec.build_values())
+        for condition in updater.conditions:
+            stmt = stmt.where(condition())
         async with self._db.begin_session_read_committed() as db_sess:
             # 1. Execute batch update
-            update_result = await execute_batch_updater(db_sess, updater)
+            update_result = await db_sess.execute(stmt.returning(session_table.c.id))
+            moved = [SessionId(row.id) for row in update_result]
+            if not moved:
+                return []
 
-            # 2. Record history
-            await self._record_scheduling_history(db_sess, bulk_creator)
+            # 2. Record history for the sessions that moved
+            await self._record_scheduling_history(
+                db_sess, bulk_creator, only_session_ids=set(moved)
+            )
 
-            return update_result.updated_count
+            return moved
 
     async def create_scheduling_history(
         self,
@@ -4092,6 +4110,8 @@ class ScheduleDBSource:
         self,
         db_sess: SASession,
         bulk_creator: BulkCreator[SessionSchedulingHistoryRow],
+        *,
+        only_session_ids: Set[SessionId] | None = None,
     ) -> int:
         """Record scheduling history with merge logic.
 
@@ -4101,12 +4121,15 @@ class ScheduleDBSource:
         Args:
             db_sess: Database session
             bulk_creator: BulkCreator containing specs for history records
+            only_session_ids: If given, records only the specs of these sessions
 
         Returns:
             Number of history records affected (merged + created)
         """
         # Build rows from specs
         new_rows = [spec.build_row() for spec in bulk_creator.specs]
+        if only_session_ids is not None:
+            new_rows = [row for row in new_rows if row.session_id in only_session_ids]
         session_ids = [SessionId(row.session_id) for row in new_rows]
 
         # Get last history records for all sessions

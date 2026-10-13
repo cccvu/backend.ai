@@ -367,10 +367,10 @@ class TestUpdateWithHistory:
         )
 
         # Execute
-        updated_count = await db_source.update_with_history(updater, bulk_creator)
+        moved = await db_source.update_with_history(updater, bulk_creator)
 
         # Verify - session should be updated
-        assert updated_count == 1
+        assert moved == [test_session_id]
 
         async with db_with_cleanup.begin_readonly_session() as db_sess:
             # Check session status
@@ -432,10 +432,10 @@ class TestUpdateWithHistory:
         )
 
         # Execute
-        updated_count = await db_source.update_with_history(updater, bulk_creator)
+        moved = await db_source.update_with_history(updater, bulk_creator)
 
         # Verify
-        assert updated_count == 1
+        assert moved == [test_session_id]
 
         async with db_with_cleanup.begin_readonly_session() as db_sess:
             # Check session status
@@ -532,10 +532,10 @@ class TestUpdateWithHistory:
         )
 
         # Execute
-        updated_count = await db_source.update_with_history(updater, bulk_creator)
+        moved = await db_source.update_with_history(updater, bulk_creator)
 
         # Verify - all sessions should be updated
-        assert updated_count == 3
+        assert set(moved) == set(session_ids)
 
         async with db_with_cleanup.begin_readonly_session() as db_sess:
             # Check all sessions are updated
@@ -587,12 +587,16 @@ class TestUpdateWithHistory:
             ]
         )
 
-        # Execute - should not fail, but update count should be 0
-        updated_count = await db_source.update_with_history(updater, bulk_creator)
+        # Execute - should not fail, and nothing is moved
+        moved = await db_source.update_with_history(updater, bulk_creator)
 
-        # Verify - no sessions updated, but history record is still created
-        # (This matches the current behavior where history is always created)
-        assert updated_count == 0
+        # Verify - no sessions updated, and no history is recorded for them
+        assert moved == []
+        async with db_with_cleanup.begin_readonly_session() as db_sess:
+            history_count = await db_sess.scalar(
+                sa.select(sa.func.count()).select_from(SessionSchedulingHistoryRow)
+            )
+        assert history_count == 0
 
     async def test_update_with_history_empty_bulk_creator(
         self,
@@ -622,10 +626,10 @@ class TestUpdateWithHistory:
         bulk_creator: BulkCreator[SessionSchedulingHistoryRow] = BulkCreator(specs=[])
 
         # Execute
-        updated_count = await db_source.update_with_history(updater, bulk_creator)
+        moved = await db_source.update_with_history(updater, bulk_creator)
 
         # Verify - session should be updated, no history records
-        assert updated_count == 1
+        assert moved == [test_session_id]
 
         async with db_with_cleanup.begin_readonly_session() as db_sess:
             stmt = sa.select(SessionRow).where(SessionRow.id == test_session_id)
@@ -1190,8 +1194,8 @@ class TestUpdateWithHistory:
         )
 
         db_source = ScheduleDBSource(db_with_cleanup)
-        updated_count = await db_source.update_with_history(updater, bulk_creator)
-        assert updated_count == 1
+        moved = await db_source.update_with_history(updater, bulk_creator)
+        assert moved == [session_id]
 
         async with db_with_cleanup.begin_readonly_session() as db_sess:
             stmt = sa.select(SessionRow).where(SessionRow.id == session_id)
