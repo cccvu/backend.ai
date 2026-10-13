@@ -633,6 +633,17 @@ class SchedulerRepository:
         )
 
     @scheduler_repository_resilience.apply()
+    async def get_sessions_terminated_on_fenced_agents(
+        self,
+        reason: str,
+        terminated_within_sec: float,
+    ) -> list[SessionId]:
+        """Get sessions terminated for ``reason`` on an agent still fenced and unavailable."""
+        return await self._db_source.get_sessions_terminated_on_fenced_agents(
+            reason, terminated_within_sec
+        )
+
+    @scheduler_repository_resilience.apply()
     async def reset_kernels_to_pending_for_sessions(
         self, session_ids: list[SessionId], reason: str
     ) -> int:

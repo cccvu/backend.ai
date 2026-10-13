@@ -173,3 +173,6 @@ ARTIFACT_MAX_SCAN_LIMIT: Final[int] = 500
 # another agent in its resource group is ALIVE. The fence stays until an operator re-enables the
 # agent, so the slots freed by the release are never handed out while its containers may run.
 UNAVAILABLE_AGENT_RELEASE_SEC: Final[int] = 300
+# While such an agent stays fenced and unavailable, the sessions released from it are queued
+# for container cleanup again on every pass, for up to this long after their release.
+UNAVAILABLE_AGENT_CLEANUP_RETRY_SEC: Final[int] = 7 * 24 * 60 * 60

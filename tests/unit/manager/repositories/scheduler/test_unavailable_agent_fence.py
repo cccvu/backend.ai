@@ -1,11 +1,16 @@
 """
-Tests for fencing unavailable agents.
+Tests for fencing unavailable agents and for keeping their released sessions queued
+for cleanup.
 
 ``ScheduleDBSource.fence_unavailable_agents`` makes an agent that has been LOST or
 TERMINATED for long enough unschedulable, but only while another agent of its
 resource group is ALIVE. It must be a compare-and-set against the agent heartbeat:
 whichever of the two commits first wins, and a heartbeat that comes after the fence
 never makes the agent schedulable again.
+
+``ScheduleDBSource.get_sessions_terminated_on_fenced_agents`` finds the sessions
+released from such an agent while it stays away, and
+``CleanupForceTerminatedHandler.fetch_session_ids`` queues them for cleanup again.
 """
 
 from __future__ import annotations
@@ -18,34 +23,54 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 import sqlalchemy as sa
 from dateutil.tz import tzutc
 
 from ai.backend.common.auth import PublicKey
+from ai.backend.common.clients.valkey_client.valkey_schedule.client import (
+    FORCE_TERMINATED_CLEANUP_TTL_SEC,
+    ValkeyScheduleClient,
+)
 from ai.backend.common.data.agent.types import AgentInfo
+from ai.backend.common.events.event_types.kernel.types import KernelLifecycleEventReason
+from ai.backend.common.identifier.domain import DomainID
 from ai.backend.common.identifier.resource_group import ResourceGroupID
+from ai.backend.common.typed_validators import HostPortPair as HostPortPairModel
 from ai.backend.common.types import (
+    AccessKey,
     AgentId,
     DeviceName,
     ResourceSlot,
+    SessionId,
     SlotName,
     SlotTypes,
+    ValkeyTarget,
 )
 from ai.backend.manager.data.agent.types import AgentHeartbeatUpsert, AgentStatus
+from ai.backend.manager.data.kernel.types import KernelStatus
+from ai.backend.manager.data.session.types import SessionStatus
 from ai.backend.manager.defs import (
+    UNAVAILABLE_AGENT_CLEANUP_RETRY_SEC,
     UNAVAILABLE_AGENT_RELEASE_SEC,
 )
 from ai.backend.manager.models.agent import AgentRow
+from ai.backend.manager.models.kernel import KernelRow
 from ai.backend.manager.models.scaling_group import ScalingGroupOpts, ScalingGroupRow
 from ai.backend.manager.models.utils import ExtendedAsyncSAEngine
 from ai.backend.manager.repositories.agent.db_source.db_source import AgentDBSource
 from ai.backend.manager.repositories.agent.updaters import AgentStatusUpdaterSpec
 from ai.backend.manager.repositories.base.updater import Updater
 from ai.backend.manager.repositories.scheduler.db_source.db_source import ScheduleDBSource
+from ai.backend.manager.sokovan.scheduler.handlers.cleanup.force_terminated import (
+    CleanupForceTerminatedHandler,
+)
 from ai.backend.manager.types import OptionalState
 from ai.backend.manager.views.sokovan.agent import FencedAgent
+
+from .conftest import create_pending_session_with_kernels
 
 RELEASE_SEC = UNAVAILABLE_AGENT_RELEASE_SEC
 LOCK_WAIT_TIMEOUT_SEC = 10.0
@@ -53,6 +78,10 @@ LOCK_WAIT_TIMEOUT_SEC = 10.0
 
 def test_release_bound_is_five_minutes() -> None:
     assert UNAVAILABLE_AGENT_RELEASE_SEC == 300
+
+
+def test_released_sessions_stay_queued_for_a_week() -> None:
+    assert UNAVAILABLE_AGENT_CLEANUP_RETRY_SEC == 7 * 24 * 60 * 60
 
 
 def test_heartbeat_never_writes_schedulable() -> None:
@@ -555,3 +584,298 @@ class TestFenceAgainstHeartbeat:
             )
         )
         assert await _schedulable(db_with_cleanup, lost_agent) is False
+
+
+HANG_TIMEOUT = KernelLifecycleEventReason.HANG_TIMEOUT.value
+RETRY_SEC = UNAVAILABLE_AGENT_CLEANUP_RETRY_SEC
+HOUR = 3600
+
+
+class _SessionFactory:
+    """Creates TERMINATED sessions whose kernels sit on the given agents."""
+
+    def __init__(
+        self,
+        db: ExtendedAsyncSAEngine,
+        *,
+        domain_id: DomainID,
+        domain_name: str,
+        group: _Group,
+        project_id: uuid.UUID,
+        user_uuid: uuid.UUID,
+        access_key: AccessKey,
+    ) -> None:
+        self._db = db
+        self._domain_id = domain_id
+        self._domain_name = domain_name
+        self._group = group
+        self._project_id = project_id
+        self._user_uuid = user_uuid
+        self._access_key = access_key
+
+    async def terminated(
+        self,
+        agent_ids: list[AgentId],
+        *,
+        reason: str = HANG_TIMEOUT,
+        terminated_ago_sec: float = HOUR,
+        kernel_status: KernelStatus = KernelStatus.TERMINATED,
+    ) -> SessionId:
+        session_id, _ = await create_pending_session_with_kernels(
+            self._db,
+            domain_id=self._domain_id,
+            domain_name=self._domain_name,
+            resource_group_id=self._group.id,
+            scaling_group_name=self._group.name,
+            group_id=self._project_id,
+            user_uuid=self._user_uuid,
+            access_key=self._access_key,
+            agent_assignments=[(agent_id, Decimal("1"), Decimal("1024")) for agent_id in agent_ids],
+            session_status=SessionStatus.TERMINATED,
+            kernel_status=kernel_status,
+            assign_agents=True,
+        )
+        terminated_at = sa.func.now() - sa.literal(
+            timedelta(seconds=terminated_ago_sec), sa.Interval
+        )
+        async with self._db.begin() as conn:
+            await conn.execute(
+                sa.update(KernelRow)
+                .where(KernelRow.session_id == session_id)
+                .values(status_info=reason, terminated_at=terminated_at)
+            )
+        return session_id
+
+
+@pytest.fixture
+async def conftest_group(
+    test_scaling_group_id: ResourceGroupID,
+    test_scaling_group_name: str,
+) -> _Group:
+    return _Group(test_scaling_group_id, test_scaling_group_name)
+
+
+@pytest.fixture
+async def sessions(
+    db_with_cleanup: ExtendedAsyncSAEngine,
+    test_domain_id: DomainID,
+    test_domain_name: str,
+    conftest_group: _Group,
+    test_group_id: uuid.UUID,
+    test_user_uuid: uuid.UUID,
+    test_access_key: AccessKey,
+    resource_slot_types: None,
+) -> _SessionFactory:
+    return _SessionFactory(
+        db_with_cleanup,
+        domain_id=test_domain_id,
+        domain_name=test_domain_name,
+        group=conftest_group,
+        project_id=test_group_id,
+        user_uuid=test_user_uuid,
+        access_key=test_access_key,
+    )
+
+
+class TestSessionsTerminatedOnFencedAgents:
+    @pytest.fixture
+    def db_source(self, db_with_cleanup: ExtendedAsyncSAEngine) -> ScheduleDBSource:
+        return ScheduleDBSource(db_with_cleanup)
+
+    async def _fenced(
+        self, db: ExtendedAsyncSAEngine, group: _Group, status: AgentStatus = AgentStatus.LOST
+    ) -> AgentId:
+        return await _add_agent(
+            db, group, status, unavailable_for_sec=RELEASE_SEC + 60, schedulable=False
+        )
+
+    async def test_finds_sessions_released_from_an_agent_still_away(
+        self,
+        db_with_cleanup: ExtendedAsyncSAEngine,
+        db_source: ScheduleDBSource,
+        conftest_group: _Group,
+        sessions: _SessionFactory,
+    ) -> None:
+        lost = await self._fenced(db_with_cleanup, conftest_group, AgentStatus.LOST)
+        stopped = await self._fenced(db_with_cleanup, conftest_group, AgentStatus.TERMINATED)
+        on_lost = await sessions.terminated([lost])
+        on_stopped = await sessions.terminated([stopped], terminated_ago_sec=RETRY_SEC - HOUR)
+        # Two kernels of one session on the agent: the session is listed once.
+        two_kernels = await sessions.terminated([lost, lost])
+
+        found = await db_source.get_sessions_terminated_on_fenced_agents(HANG_TIMEOUT, RETRY_SEC)
+
+        assert sorted(found) == sorted([on_lost, on_stopped, two_kernels])
+
+    @pytest.mark.parametrize(
+        ("status", "schedulable"),
+        [
+            # Back: the agent heartbeats again (it stays fenced).
+            (AgentStatus.ALIVE, False),
+            (AgentStatus.RESTARTING, False),
+            # Re-enabled by an operator while still away.
+            (AgentStatus.LOST, True),
+            (AgentStatus.TERMINATED, True),
+        ],
+    )
+    async def test_skips_agents_back_or_re_enabled(
+        self,
+        db_with_cleanup: ExtendedAsyncSAEngine,
+        db_source: ScheduleDBSource,
+        conftest_group: _Group,
+        sessions: _SessionFactory,
+        status: AgentStatus,
+        schedulable: bool,
+    ) -> None:
+        agent_id = await _add_agent(
+            db_with_cleanup,
+            conftest_group,
+            status,
+            unavailable_for_sec=RELEASE_SEC + 60,
+            schedulable=schedulable,
+        )
+        await sessions.terminated([agent_id])
+
+        assert (
+            await db_source.get_sessions_terminated_on_fenced_agents(HANG_TIMEOUT, RETRY_SEC) == []
+        )
+
+        # With another agent still fenced and away, only its sessions are listed.
+        away = await self._fenced(db_with_cleanup, conftest_group)
+        on_away = await sessions.terminated([away])
+        found = await db_source.get_sessions_terminated_on_fenced_agents(HANG_TIMEOUT, RETRY_SEC)
+        assert found == [on_away]
+
+    @pytest.mark.parametrize(
+        ("reason", "terminated_ago_sec", "kernel_status"),
+        [
+            # Another reason.
+            ("force-terminated", HOUR, KernelStatus.TERMINATED),
+            ("user-requested", HOUR, KernelStatus.TERMINATED),
+            # Released too long ago.
+            (HANG_TIMEOUT, RETRY_SEC + HOUR, KernelStatus.TERMINATED),
+            # Not terminated.
+            (HANG_TIMEOUT, HOUR, KernelStatus.TERMINATING),
+            (HANG_TIMEOUT, HOUR, KernelStatus.CANCELLED),
+        ],
+    )
+    async def test_skips_other_kernels(
+        self,
+        db_with_cleanup: ExtendedAsyncSAEngine,
+        db_source: ScheduleDBSource,
+        conftest_group: _Group,
+        sessions: _SessionFactory,
+        reason: str,
+        terminated_ago_sec: float,
+        kernel_status: KernelStatus,
+    ) -> None:
+        agent_id = await self._fenced(db_with_cleanup, conftest_group)
+        await sessions.terminated(
+            [agent_id],
+            reason=reason,
+            terminated_ago_sec=terminated_ago_sec,
+            kernel_status=kernel_status,
+        )
+
+        assert (
+            await db_source.get_sessions_terminated_on_fenced_agents(HANG_TIMEOUT, RETRY_SEC) == []
+        )
+
+
+class TestCleanupRequeueWithValkey:
+    """The real cleanup handler against the database and Valkey (the agent RPC is a stub)."""
+
+    @pytest.fixture
+    async def valkey_schedule(
+        self,
+        redis_container: tuple[str, HostPortPairModel],
+    ) -> AsyncIterator[ValkeyScheduleClient]:
+        _, hostport_pair = redis_container
+        client = await ValkeyScheduleClient.create(
+            valkey_target=ValkeyTarget(addr=hostport_pair.address),
+            db_id=0,
+            human_readable_name="test-unavailable-agent-fence",
+        )
+        await _delete_cleanup_key(client)
+        try:
+            yield client
+        finally:
+            await _delete_cleanup_key(client)
+            await client.close()
+
+    @pytest.fixture
+    def handler(
+        self,
+        db_with_cleanup: ExtendedAsyncSAEngine,
+        valkey_schedule: ValkeyScheduleClient,
+    ) -> CleanupForceTerminatedHandler:
+        terminator = AsyncMock()
+        terminator.terminate_sessions_for_handler = AsyncMock(return_value=[])
+        return CleanupForceTerminatedHandler(
+            terminator=terminator,
+            # The db source has the same method the handler calls on the repository.
+            repository=ScheduleDBSource(db_with_cleanup),  # type: ignore[arg-type]
+            valkey_schedule=valkey_schedule,
+        )
+
+    async def test_requeues_while_the_agent_is_away_and_stops_once_it_is_back(
+        self,
+        db_with_cleanup: ExtendedAsyncSAEngine,
+        conftest_group: _Group,
+        sessions: _SessionFactory,
+        handler: CleanupForceTerminatedHandler,
+        valkey_schedule: ValkeyScheduleClient,
+    ) -> None:
+        await _add_agent(db_with_cleanup, conftest_group, AgentStatus.ALIVE)
+        agent_id = await _add_agent(
+            db_with_cleanup,
+            conftest_group,
+            AgentStatus.LOST,
+            unavailable_for_sec=RELEASE_SEC + 60,
+        )
+        fenced = await ScheduleDBSource(db_with_cleanup).fence_unavailable_agents(
+            [agent_id], conftest_group.id, RELEASE_SEC
+        )
+        assert [agent.agent_id for agent in fenced] == [agent_id]
+        released = await sessions.terminated([agent_id])
+        other = await sessions.terminated([agent_id], reason="user-requested")
+
+        # Nothing was queued (the set expired, or adding to it failed): queued again.
+        assert await handler.fetch_session_ids() == [released]
+        assert await valkey_schedule.get_force_terminated_sessions() == [released]
+        assert await _cleanup_ttl(valkey_schedule) > FORCE_TERMINATED_CLEANUP_TTL_SEC - 10
+
+        # Each pass refreshes the set's TTL.
+        await _expire_cleanup_key(valkey_schedule, 5)
+        assert await handler.fetch_session_ids() == [released]
+        assert await _cleanup_ttl(valkey_schedule) > FORCE_TERMINATED_CLEANUP_TTL_SEC - 10
+
+        # Ids queued by others are kept and returned once.
+        await valkey_schedule.add_force_terminated_sessions([other])
+        assert sorted(await handler.fetch_session_ids()) == sorted([released, other])
+        await valkey_schedule.remove_force_terminated_sessions([other])
+
+        # The agent comes back (it stays fenced): no more requeues, the set runs out.
+        await AgentDBSource(db_with_cleanup).upsert_agent_with_state(
+            _heartbeat(agent_id, conftest_group.name)
+        )
+        assert await _schedulable(db_with_cleanup, agent_id) is False
+        assert await handler.fetch_session_ids() == [released]
+        await _delete_cleanup_key(valkey_schedule)
+        assert await handler.fetch_session_ids() == []
+        assert await valkey_schedule.get_force_terminated_sessions() == []
+
+
+async def _delete_cleanup_key(client: ValkeyScheduleClient) -> None:
+    async with client._client.client() as conn:
+        await conn.delete([client._get_force_terminated_cleanup_key()])
+
+
+async def _expire_cleanup_key(client: ValkeyScheduleClient, seconds: int) -> None:
+    async with client._client.client() as conn:
+        await conn.expire(client._get_force_terminated_cleanup_key(), seconds)
+
+
+async def _cleanup_ttl(client: ValkeyScheduleClient) -> int:
+    async with client._client.client() as conn:
+        return await conn.ttl(client._get_force_terminated_cleanup_key())

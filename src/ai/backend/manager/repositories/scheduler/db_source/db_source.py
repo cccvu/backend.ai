@@ -3264,6 +3264,47 @@ class ScheduleDBSource:
             for row in rows
         ]
 
+    async def get_sessions_terminated_on_fenced_agents(
+        self,
+        reason: str,
+        terminated_within_sec: float,
+    ) -> list[SessionId]:
+        """
+        Get sessions with a kernel terminated for ``reason`` on an agent that is still away.
+
+        A kernel qualifies if it is TERMINATED with ``status_info == reason``, it was
+        terminated within ``terminated_within_sec`` (by the database clock), and its agent
+        is unschedulable and LOST or TERMINATED. Once the agent is ALIVE again or
+        re-enabled, its sessions no longer qualify.
+
+        :param reason: The kernels' termination reason (status_info)
+        :param terminated_within_sec: How far back to look
+        :return: Distinct session IDs
+        """
+        fenced_agents_stmt = sa.select(AgentRow.id).where(
+            AgentRow.schedulable.is_(False),
+            AgentRow.status.in_((AgentStatus.LOST, AgentStatus.TERMINATED)),
+        )
+        async with self._db.begin_readonly_read_committed() as db_conn:
+            # Usually no agent is fenced: skip the kernel scan then.
+            agent_ids = (await db_conn.execute(fenced_agents_stmt)).scalars().all()
+            if not agent_ids:
+                return []
+            stmt = (
+                sa.select(KernelRow.session_id)
+                .distinct()
+                .where(
+                    KernelRow.agent.in_(agent_ids),
+                    KernelRow.status == KernelStatus.TERMINATED,
+                    KernelRow.status_info == reason,
+                    KernelRow.terminated_at
+                    >= sa.func.now()
+                    - sa.literal(timedelta(seconds=terminated_within_sec), sa.Interval),
+                )
+            )
+            rows = (await db_conn.execute(stmt)).fetchall()
+        return [SessionId(row.session_id) for row in rows]
+
     async def update_kernels_to_creating_for_sessions(
         self, session_ids: list[SessionId], reason: str
     ) -> int:

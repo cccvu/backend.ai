@@ -10,6 +10,7 @@ from uuid import uuid4
 
 import pytest
 
+from ai.backend.common.events.event_types.kernel.types import KernelLifecycleEventReason
 from ai.backend.common.types import (
     AccessKey,
     AgentId,
@@ -20,6 +21,7 @@ from ai.backend.common.types import (
 )
 from ai.backend.manager.data.kernel.types import KernelStatus
 from ai.backend.manager.data.session.types import SessionStatus
+from ai.backend.manager.defs import UNAVAILABLE_AGENT_CLEANUP_RETRY_SEC
 from ai.backend.manager.sokovan.recorder.context import RecorderContext
 from ai.backend.manager.sokovan.scheduler.handlers.cleanup.force_terminated import (
     CleanupForceTerminatedHandler,
@@ -46,6 +48,7 @@ def mock_terminator() -> AsyncMock:
 def mock_repository() -> AsyncMock:
     repository = AsyncMock()
     repository.get_terminating_sessions_by_ids = AsyncMock(return_value=[])
+    repository.get_sessions_terminated_on_fenced_agents = AsyncMock(return_value=[])
     return repository
 
 
@@ -54,6 +57,7 @@ def mock_valkey_schedule() -> AsyncMock:
     valkey = AsyncMock()
     valkey.get_force_terminated_sessions = AsyncMock(return_value=[])
     valkey.remove_force_terminated_sessions = AsyncMock(return_value=None)
+    valkey.add_force_terminated_sessions = AsyncMock(return_value=None)
     return valkey
 
 
@@ -106,6 +110,58 @@ class TestCleanupForceTerminatedHandler:
         result = await handler.fetch_session_ids()
 
         assert list(result) == session_ids
+        mock_valkey_schedule.add_force_terminated_sessions.assert_not_awaited()
+
+    async def test_fetch_session_ids_requeues_sessions_on_fenced_agents(
+        self,
+        handler: CleanupForceTerminatedHandler,
+        mock_repository: AsyncMock,
+        mock_valkey_schedule: AsyncMock,
+    ) -> None:
+        queued = SessionId(uuid4())
+        released = SessionId(uuid4())
+        mock_repository.get_sessions_terminated_on_fenced_agents.return_value = [released]
+        mock_valkey_schedule.get_force_terminated_sessions.return_value = [queued, released]
+
+        result = await handler.fetch_session_ids()
+
+        mock_repository.get_sessions_terminated_on_fenced_agents.assert_awaited_once_with(
+            KernelLifecycleEventReason.HANG_TIMEOUT.value,
+            UNAVAILABLE_AGENT_CLEANUP_RETRY_SEC,
+        )
+        mock_valkey_schedule.add_force_terminated_sessions.assert_awaited_once_with([released])
+        assert list(result) == [queued, released]
+
+    async def test_fetch_session_ids_returns_requeued_ids_when_adding_them_fails(
+        self,
+        handler: CleanupForceTerminatedHandler,
+        mock_repository: AsyncMock,
+        mock_valkey_schedule: AsyncMock,
+    ) -> None:
+        queued = SessionId(uuid4())
+        released = SessionId(uuid4())
+        mock_repository.get_sessions_terminated_on_fenced_agents.return_value = [released]
+        mock_valkey_schedule.add_force_terminated_sessions.side_effect = RuntimeError("valkey")
+        mock_valkey_schedule.get_force_terminated_sessions.return_value = [queued]
+
+        result = await handler.fetch_session_ids()
+
+        assert list(result) == [queued, released]
+
+    async def test_fetch_session_ids_falls_back_to_valkey_when_the_query_fails(
+        self,
+        handler: CleanupForceTerminatedHandler,
+        mock_repository: AsyncMock,
+        mock_valkey_schedule: AsyncMock,
+    ) -> None:
+        queued = SessionId(uuid4())
+        mock_repository.get_sessions_terminated_on_fenced_agents.side_effect = RuntimeError("db")
+        mock_valkey_schedule.get_force_terminated_sessions.return_value = [queued]
+
+        result = await handler.fetch_session_ids()
+
+        mock_valkey_schedule.add_force_terminated_sessions.assert_not_awaited()
+        assert list(result) == [queued]
 
     async def test_execute_sends_rpc_and_removes_succeeded(
         self,
