@@ -259,6 +259,7 @@ def _create_lifecycle_handlers(
         ),
         ScheduleType.EXPIRE_STUCK_STARTS: ExpireStuckStartsLifecycleHandler(
             args.repository,
+            args.scheduling_controller,
         ),
     }
 

@@ -5,17 +5,18 @@ from __future__ import annotations
 import logging
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
-from typing import Final, override
+from typing import TYPE_CHECKING, Final, override
 
 from ai.backend.common.events.event_types.kernel.types import KernelLifecycleEventReason
 from ai.backend.common.identifier.resource_group import ResourceGroupID
-from ai.backend.common.types import AccessKey
+from ai.backend.common.types import AccessKey, AgentId, SessionId
 from ai.backend.logging import BraceStyleAdapter
 from ai.backend.manager.data.kernel.types import KernelStatus
 from ai.backend.manager.data.session.types import SessionStatus, StatusTransitions, TransitionStatus
 from ai.backend.manager.defs import (
     SESSION_CREATING_EXPIRY_SEC,
     SESSION_PULLING_EXPIRY_SEC,
+    UNAVAILABLE_AGENT_RELEASE_SEC,
     LockID,
 )
 from ai.backend.manager.repositories.scheduler.repository import SchedulerRepository
@@ -25,6 +26,9 @@ from ai.backend.manager.sokovan.scheduler.results import (
     SessionTransitionInfo,
 )
 from ai.backend.manager.views.sokovan.lifecycle import SessionWithKernels
+
+if TYPE_CHECKING:
+    from ai.backend.manager.sokovan.scheduling_controller import SchedulingController
 
 log = BraceStyleAdapter(logging.getLogger(__name__))
 
@@ -39,6 +43,9 @@ _STARTING_STATUSES: Final[tuple[SessionStatus, ...]] = (
     SessionStatus.PREPARED,
     SessionStatus.CREATING,
 )
+
+# The status_info of a session (and its kernels) released from an unavailable agent.
+RELEASE_REASON: Final[str] = KernelLifecycleEventReason.HANG_TIMEOUT.value
 
 
 class ExpireStuckStartsLifecycleHandler(SessionLifecycleHandler):
@@ -61,17 +68,34 @@ class ExpireStuckStartsLifecycleHandler(SessionLifecycleHandler):
     their resources. The transition moves only sessions still in the status they were read in,
     so the handler needs no lock and concurrent runs are safe.
 
-    ``execute`` dispatches each session to the branch for its status family. Another family
-    (for example TERMINATING) joins by adding its statuses to ``target_statuses`` and a branch
-    to ``execute``; a branch that releases sessions by its own means reports nothing in the
-    result.
+    It also releases TERMINATING sessions held by an unavailable agent. TERMINATE cannot
+    finish such a session: its destroy never reaches the agent, so the session keeps its
+    resources until the agent answers. A TERMINATING session is released when:
+
+    - its open (not terminal) kernels are not empty, all have an agent, and all sit on one
+      agent;
+    - that agent is LOST or TERMINATED, first seen so ``UNAVAILABLE_AGENT_RELEASE_SEC`` or
+      more ago, and some agent of the same resource group is ALIVE (so a fault that marks
+      every agent of the group unavailable at once releases nothing).
+
+    The agent is fenced first (made unschedulable, committed): its containers may still run,
+    so the resources the release frees must not be handed out on it again until an operator
+    has reconciled it and re-enabled it. Only the sessions of agents the fence returned are
+    then terminated by force (``RELEASE_REASON``): the session and its kernels become
+    TERMINATED, their resources are freed, and their ids are queued for container cleanup,
+    which keeps retrying the destroy while the agent stays fenced and away. This branch
+    reports nothing in the result, and an error in it never affects the expiry's results.
+
+    ``execute`` dispatches each session to the branch for its status family.
     """
 
     def __init__(
         self,
         repository: SchedulerRepository,
+        scheduling_controller: SchedulingController,
     ) -> None:
         self._repository = repository
+        self._scheduling_controller = scheduling_controller
 
     @classmethod
     @override
@@ -82,8 +106,8 @@ class ExpireStuckStartsLifecycleHandler(SessionLifecycleHandler):
     @classmethod
     @override
     def target_statuses(cls) -> list[SessionStatus]:
-        """Sessions that are starting."""
-        return list(_STARTING_STATUSES)
+        """Sessions that are starting, and sessions that are terminating."""
+        return [*_STARTING_STATUSES, SessionStatus.TERMINATING]
 
     @classmethod
     @override
@@ -123,13 +147,71 @@ class ExpireStuckStartsLifecycleHandler(SessionLifecycleHandler):
         resource_group_id: ResourceGroupID,
         sessions: Sequence[SessionWithKernels],
     ) -> SessionExecutionResult:
-        """Report the sessions whose start has expired as successes."""
+        """Report the sessions whose start has expired as successes, and release the
+        terminating sessions held by an unavailable agent."""
         result = SessionExecutionResult()
         starting = [s for s in sessions if s.session_info.lifecycle.status in _STARTING_STATUSES]
+        terminating = [
+            s for s in sessions if s.session_info.lifecycle.status == SessionStatus.TERMINATING
+        ]
         if starting:
             now = await self._repository.get_db_now()
             result.successes.extend(self._expire_stuck_starts(resource_group_id, starting, now))
+        if terminating:
+            try:
+                await self._release_unavailable_agents(resource_group_id, terminating)
+            except Exception:
+                log.exception(
+                    "expire-stuck-starts: failed to release terminating sessions held by"
+                    " unavailable agents in resource group {}",
+                    resource_group_id,
+                )
         return result
+
+    async def _release_unavailable_agents(
+        self,
+        resource_group_id: ResourceGroupID,
+        sessions: Sequence[SessionWithKernels],
+    ) -> None:
+        candidates: dict[AgentId, list[SessionId]] = {}
+        for session in sessions:
+            agent_id = sole_agent(session)
+            if agent_id is not None:
+                candidates.setdefault(agent_id, []).append(session.session_info.identity.id)
+        if not candidates:
+            return
+        # Fence first: the release frees resources on the agent, which must not be handed
+        # out again while its containers may still run.
+        fenced = await self._repository.fence_unavailable_agents(
+            sorted(candidates), resource_group_id, UNAVAILABLE_AGENT_RELEASE_SEC
+        )
+        to_release: list[SessionId] = []
+        for agent in fenced:
+            session_ids = candidates.get(agent.agent_id, [])
+            log.warning(
+                "expire-stuck-starts: fenced agent {} ({} since {}, resource group {}):"
+                " schedulable=false; force-releasing {} terminating sessions ({})."
+                " Reconcile its containers before re-enabling it.",
+                agent.agent_id,
+                agent.status.name,
+                agent.lost_at.isoformat(),
+                resource_group_id,
+                len(session_ids),
+                RELEASE_REASON,
+            )
+            to_release.extend(session_ids)
+        if not to_release:
+            return
+        released = await self._scheduling_controller.mark_sessions_for_termination(
+            to_release, reason=RELEASE_REASON, forced=True
+        )
+        log.info(
+            "expire-stuck-starts: released {} of {} terminating sessions on fenced agents"
+            " (sessions: {})",
+            len(released.force_terminated_sessions),
+            len(to_release),
+            [str(sid) for sid in released.force_terminated_sessions],
+        )
 
     def _expire_stuck_starts(
         self,
@@ -177,6 +259,28 @@ class ExpireStuckStartsLifecycleHandler(SessionLifecycleHandler):
                 )
             )
         return expired
+
+
+def sole_agent(session: SessionWithKernels) -> AgentId | None:
+    """Return the one agent all of the session's open kernels sit on, or None.
+
+    None when the session has no open (not terminal) kernel, when an open kernel has no
+    agent (for example a PENDING kernel), or when its open kernels sit on more than one agent.
+    """
+    open_kernels = [
+        k
+        for k in session.kernel_infos
+        if k.lifecycle.status not in KernelStatus.terminal_statuses()
+    ]
+    if not open_kernels:
+        return None
+    agents = {k.resource.agent for k in open_kernels}
+    if len(agents) != 1:
+        return None
+    (agent,) = agents
+    if not agent:
+        return None
+    return AgentId(agent)
 
 
 def expiry_bound(session: SessionWithKernels) -> float | None:

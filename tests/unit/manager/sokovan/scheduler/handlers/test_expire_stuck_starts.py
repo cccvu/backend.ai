@@ -95,7 +95,7 @@ class TestExpireStuckStartsLifecycleHandler:
 
     @pytest.fixture
     def handler(self, repository: AsyncMock) -> ExpireStuckStartsLifecycleHandler:
-        return ExpireStuckStartsLifecycleHandler(repository)
+        return ExpireStuckStartsLifecycleHandler(repository, AsyncMock())
 
     # ------------------------------------------------------------------ declaration
 
@@ -111,6 +111,8 @@ class TestExpireStuckStartsLifecycleHandler:
             SessionStatus.PULLING,
             SessionStatus.PREPARED,
             SessionStatus.CREATING,
+            # For the release of sessions held by an unavailable agent (reports nothing).
+            SessionStatus.TERMINATING,
         }
         # Sessions whose kernels are all PENDING must be seen too.
         assert handler.target_kernel_statuses() is None
@@ -328,12 +330,13 @@ class TestExpireStuckStartsLifecycleHandler:
         repository: AsyncMock,
         session_factory: SessionFactory,
     ) -> None:
-        """Only the starting family is expired; another status reaching execute() is not."""
+        """Only the starting family is expired; another status reaching execute() is not.
+
+        (TERMINATING sessions go to the release branch, which reports nothing.)"""
         sessions = [
             _stuck(session_factory, status, [KernelStatus.RUNNING], 10**6)
             for status in (
                 SessionStatus.RUNNING,
-                SessionStatus.TERMINATING,
                 SessionStatus.PENDING,
             )
         ]
@@ -493,7 +496,9 @@ class TestExpireStuckStartsInTheCoordinator:
             ),
             handlers=CoordinatorHandlers(
                 lifecycle_handlers={
-                    ScheduleType.EXPIRE_STUCK_STARTS: ExpireStuckStartsLifecycleHandler(repository),
+                    ScheduleType.EXPIRE_STUCK_STARTS: ExpireStuckStartsLifecycleHandler(
+                        repository, scheduling_controller
+                    ),
                 },
                 promotion_specs={},
                 kernel_handlers={},
