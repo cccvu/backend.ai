@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from datetime import datetime
 from decimal import Decimal
 from functools import cached_property
 
@@ -11,6 +12,7 @@ from ai.backend.common.identifier.architecture import ArchName
 from ai.backend.common.identifier.resource_slot import ResourceSlotName
 from ai.backend.common.identifier.session_group import SessionGroupID
 from ai.backend.common.types import AgentId, SessionId
+from ai.backend.manager.data.agent.types import AgentStatus
 
 
 @dataclass(frozen=True)
@@ -112,3 +114,14 @@ class ResourceGroupResource:
                         used=current.used + resource.used,
                     )
         return totals
+
+
+@dataclass(frozen=True)
+class FencedAgent:
+    """An unavailable agent the scheduler has just made unschedulable."""
+
+    agent_id: AgentId
+    # LOST or TERMINATED
+    status: AgentStatus
+    # When the agent was first seen unavailable
+    lost_at: datetime

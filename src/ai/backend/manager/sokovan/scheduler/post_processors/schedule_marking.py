@@ -23,7 +23,9 @@ log = BraceStyleAdapter(logging.getLogger(__name__))
 STATUS_TO_NEXT_SCHEDULE_TYPE: dict[SessionStatus, ScheduleType] = {
     SessionStatus.PENDING: ScheduleType.SCHEDULE,
     SessionStatus.SCHEDULED: ScheduleType.CHECK_PRECONDITION,
+    SessionStatus.PREPARING: ScheduleType.CHECK_PULLING_PROGRESS,
     SessionStatus.PREPARED: ScheduleType.START,
+    SessionStatus.CREATING: ScheduleType.CHECK_CREATING_PROGRESS,
     SessionStatus.DEPRIORITIZING: ScheduleType.DEPRIORITIZE,
     SessionStatus.TERMINATING: ScheduleType.TERMINATE,
     # When a session terminates, freed resources may allow pending sessions to be scheduled.

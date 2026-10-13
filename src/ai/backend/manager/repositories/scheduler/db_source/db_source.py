@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping, Sequence, Set
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -19,7 +19,7 @@ import sqlalchemy as sa
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncConnection as SAConnection
 from sqlalchemy.ext.asyncio import AsyncSession as SASession
-from sqlalchemy.orm import load_only, selectinload
+from sqlalchemy.orm import aliased, load_only, selectinload
 
 from ai.backend.common import msgpack
 from ai.backend.common.data.permission.types import (
@@ -113,7 +113,7 @@ from ai.backend.manager.repositories.base.rbac.entity_creator import (
     execute_rbac_bulk_entity_creator,
     execute_rbac_entity_creator,
 )
-from ai.backend.manager.repositories.base.updater import BatchUpdater, execute_batch_updater
+from ai.backend.manager.repositories.base.updater import BatchUpdater
 from ai.backend.manager.repositories.resource_slot.types import (
     resource_slot_to_quantities,
 )
@@ -139,6 +139,7 @@ from ai.backend.manager.types import UserScope
 from ai.backend.manager.views.sokovan.agent import (
     AgentMeta,
     AgentResource,
+    FencedAgent,
     SlotResource,
 )
 from ai.backend.manager.views.sokovan.allocation import (
@@ -1213,8 +1214,9 @@ class ScheduleDBSource:
         scheduling history, as every status transition does.
 
         Only the session status moves; what the new status means happens later,
-        in the handler that owns it. Sessions already in a terminal status are
-        skipped.
+        in the handler that owns it. Sessions already in a terminal status, or
+        being terminated (TERMINATING), are skipped: a termination is never
+        overwritten by another transition.
 
         :param session_ids: Sessions to transition
         :param to_status: Target session status
@@ -1229,6 +1231,7 @@ class ScheduleDBSource:
             markable = sa.and_(
                 SessionRow.id.in_(session_ids),
                 SessionRow.status.not_in(SessionStatus.terminal_statuses()),
+                SessionRow.status != SessionStatus.TERMINATING,
             )
             status_result = await db_sess.execute(
                 sa.select(SessionRow.id, SessionRow.status).where(markable)
@@ -1406,33 +1409,17 @@ class ScheduleDBSource:
         await savepoint.commit()
         return True
 
-    async def _free_kernel_allocations(
-        self,
-        db_sess: SASession,
-        kernel_ids: Sequence[UUID],
-        now: datetime,
-    ) -> None:
-        """Set ``free_at`` on the given kernels' active allocations. Only sets
-        ``free_at`` and does not adjust ``agent_resources.used`` -- callers
-        whose source statuses can include RUNNING/TERMINATING must use
-        ``update_kernel_status_terminated`` instead. Idempotent.
-        """
-        if not kernel_ids:
-            return
-        await db_sess.execute(
-            sa.update(ResourceAllocationRow)
-            .where(
-                ResourceAllocationRow.kernel_id.in_(kernel_ids),
-                ResourceAllocationRow.free_at.is_(None),
-            )
-            .values(free_at=now)
-        )
-
     async def _cancel_pending_sessions(
         self, db_sess: SASession, session_ids: list[SessionId], reason: str, now: datetime
     ) -> list[SessionId]:
         """Cancel PENDING sessions and their kernels, and free the kernels'
         ``resource_allocations`` rows in the same transaction.
+
+        A PENDING session's kernels may already hold a reservation on an agent:
+        the scheduling pass reserves and places kernels before it moves the
+        session to SCHEDULED. The kernels' holds on ``agent_resources`` are
+        released along with their rows, so a cancel that races the scheduling
+        pass leaks nothing.
         """
         # Capture from_statuses before update for history recording
         status_query = sa.select(SessionRow.id, SessionRow.status).where(
@@ -1481,7 +1468,7 @@ class ScheduleDBSource:
                 .returning(KernelRow.id)
             )
             cancelled_kernel_ids = [row.id for row in kernel_update_result]
-            await self._free_kernel_allocations(db_sess, cancelled_kernel_ids, now)
+            await self._free_allocations_and_release(db_sess, cancelled_kernel_ids, now)
 
             # Record scheduling history for cancel transition
             history_specs = [
@@ -3219,6 +3206,105 @@ class ScheduleDBSource:
             result[row.session_id].append(AgentId(row.agent))
         return dict(result)
 
+    async def fence_unavailable_agents(
+        self,
+        agent_ids: Sequence[AgentId],
+        resource_group_id: ResourceGroupID,
+        unavailable_for_sec: float,
+    ) -> list[FencedAgent]:
+        """
+        Make the given agents unschedulable if they have been unavailable long enough.
+
+        An agent is fenced only if it is in the given resource group, it is LOST or
+        TERMINATED, it has been so for at least ``unavailable_for_sec`` (by the database
+        clock), and some agent in the same resource group is ALIVE. The last condition
+        keeps a fault that marks every agent of a group unavailable at once (for example
+        on the manager's side) from fencing them all.
+
+        This is a single guarded UPDATE in its own READ COMMITTED transaction, so it is a
+        compare-and-set against the heartbeat, which locks the agent row before it marks
+        the agent ALIVE: whichever commits first wins. The heartbeat never writes
+        ``schedulable``, so a fence outlives the agent's return until an operator
+        re-enables the agent. An agent already unschedulable is returned again.
+
+        :param agent_ids: Agents to fence
+        :param resource_group_id: The resource group the agents must belong to
+        :param unavailable_for_sec: Minimum time since the agent was found unavailable
+        :return: The agents this call fenced (or found fenced), with their status and lost_at
+        """
+        if not agent_ids:
+            return []
+        unavailable = (AgentStatus.LOST, AgentStatus.TERMINATED)
+        peer = aliased(AgentRow, name="peer")
+        alive_peer_exists = (
+            sa.select(peer.id)
+            .where(
+                peer.resource_group_id == resource_group_id,
+                peer.status == AgentStatus.ALIVE,
+            )
+            .exists()
+        )
+        stmt = (
+            sa.update(AgentRow)
+            .where(
+                AgentRow.id.in_(list(agent_ids)),
+                AgentRow.resource_group_id == resource_group_id,
+                AgentRow.status.in_(unavailable),
+                AgentRow.lost_at
+                <= sa.func.now() - sa.literal(timedelta(seconds=unavailable_for_sec), sa.Interval),
+                alive_peer_exists,
+            )
+            .values(schedulable=False)
+            .returning(AgentRow.id, AgentRow.status, AgentRow.lost_at)
+        )
+        async with self._db.begin_read_committed() as db_conn:
+            rows = (await db_conn.execute(stmt)).fetchall()
+        return [
+            FencedAgent(agent_id=AgentId(row.id), status=row.status, lost_at=row.lost_at)
+            for row in rows
+        ]
+
+    async def get_sessions_terminated_on_fenced_agents(
+        self,
+        reason: str,
+        terminated_within_sec: float,
+    ) -> list[SessionId]:
+        """
+        Get sessions with a kernel terminated for ``reason`` on an agent that is still away.
+
+        A kernel qualifies if it is TERMINATED with ``status_info == reason``, it was
+        terminated within ``terminated_within_sec`` (by the database clock), and its agent
+        is unschedulable and LOST or TERMINATED. Once the agent is ALIVE again or
+        re-enabled, its sessions no longer qualify.
+
+        :param reason: The kernels' termination reason (status_info)
+        :param terminated_within_sec: How far back to look
+        :return: Distinct session IDs
+        """
+        fenced_agents_stmt = sa.select(AgentRow.id).where(
+            AgentRow.schedulable.is_(False),
+            AgentRow.status.in_((AgentStatus.LOST, AgentStatus.TERMINATED)),
+        )
+        async with self._db.begin_readonly_read_committed() as db_conn:
+            # Usually no agent is fenced: skip the kernel scan then.
+            agent_ids = (await db_conn.execute(fenced_agents_stmt)).scalars().all()
+            if not agent_ids:
+                return []
+            stmt = (
+                sa.select(KernelRow.session_id)
+                .distinct()
+                .where(
+                    KernelRow.agent.in_(agent_ids),
+                    KernelRow.status == KernelStatus.TERMINATED,
+                    KernelRow.status_info == reason,
+                    KernelRow.terminated_at
+                    >= sa.func.now()
+                    - sa.literal(timedelta(seconds=terminated_within_sec), sa.Interval),
+                )
+            )
+            rows = (await db_conn.execute(stmt)).fetchall()
+        return [SessionId(row.session_id) for row in rows]
+
     async def update_kernels_to_creating_for_sessions(
         self, session_ids: list[SessionId], reason: str
     ) -> int:
@@ -4043,7 +4129,7 @@ class ScheduleDBSource:
         self,
         updater: BatchUpdater[SessionRow],
         bulk_creator: BulkCreator[SessionSchedulingHistoryRow],
-    ) -> int:
+    ) -> list[SessionId]:
         """Update session statuses and record history in same transaction.
 
         This method combines batch status update with history recording,
@@ -4051,21 +4137,39 @@ class ScheduleDBSource:
         Uses merge logic to prevent duplicate history records when status
         doesn't change.
 
+        History is recorded only for the sessions the update actually moved,
+        so a session that the conditions rejected (for example, one that left
+        its expected status in the meantime) gets no history row.
+
+        The transaction runs at READ COMMITTED on purpose: when a matching
+        row is locked by a concurrent transaction, PostgreSQL waits for it
+        and re-checks the WHERE clause against the newly committed row, so
+        a status guard in ``updater.conditions`` is a real compare-and-set.
+
         Args:
             updater: BatchUpdater containing spec and conditions for session update
             bulk_creator: BulkCreator containing specs for history records
 
         Returns:
-            Number of sessions updated
+            IDs of the sessions updated
         """
+        session_table = SessionRow.__table__
+        stmt = sa.update(session_table).values(updater.spec.build_values())
+        for condition in updater.conditions:
+            stmt = stmt.where(condition())
         async with self._db.begin_session_read_committed() as db_sess:
             # 1. Execute batch update
-            update_result = await execute_batch_updater(db_sess, updater)
+            update_result = await db_sess.execute(stmt.returning(session_table.c.id))
+            moved = [SessionId(row.id) for row in update_result]
+            if not moved:
+                return []
 
-            # 2. Record history
-            await self._record_scheduling_history(db_sess, bulk_creator)
+            # 2. Record history for the sessions that moved
+            await self._record_scheduling_history(
+                db_sess, bulk_creator, only_session_ids=set(moved)
+            )
 
-            return update_result.updated_count
+            return moved
 
     async def create_scheduling_history(
         self,
@@ -4092,6 +4196,8 @@ class ScheduleDBSource:
         self,
         db_sess: SASession,
         bulk_creator: BulkCreator[SessionSchedulingHistoryRow],
+        *,
+        only_session_ids: Set[SessionId] | None = None,
     ) -> int:
         """Record scheduling history with merge logic.
 
@@ -4101,12 +4207,15 @@ class ScheduleDBSource:
         Args:
             db_sess: Database session
             bulk_creator: BulkCreator containing specs for history records
+            only_session_ids: If given, records only the specs of these sessions
 
         Returns:
             Number of history records affected (merged + created)
         """
         # Build rows from specs
         new_rows = [spec.build_row() for spec in bulk_creator.specs]
+        if only_session_ids is not None:
+            new_rows = [row for row in new_rows if row.session_id in only_session_ids]
         session_ids = [SessionId(row.session_id) for row in new_rows]
 
         # Get last history records for all sessions

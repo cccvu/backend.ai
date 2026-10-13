@@ -9,13 +9,17 @@ Test Scenarios:
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from unittest.mock import AsyncMock, MagicMock
+from uuid import uuid4
 
-from ai.backend.common.types import AgentId, KernelId
-from ai.backend.manager.data.kernel.types import KernelInfo
+from ai.backend.common.types import AgentId, KernelId, SessionId
+from ai.backend.manager.data.kernel.types import KernelInfo, KernelStatus
+from ai.backend.manager.data.session.types import SessionStatus
 from ai.backend.manager.sokovan.recorder import RecorderContext
 from ai.backend.manager.sokovan.scheduler.terminator.terminator import SessionTerminator
-from ai.backend.manager.views.sokovan.session import TerminatingSessionData
+from ai.backend.manager.sokovan.scheduler.types import ScheduleType
+from ai.backend.manager.views.sokovan.session import TerminatingKernelData, TerminatingSessionData
 
 # =============================================================================
 # TestSessionTerminatorTermination (SC-TE-001 ~ SC-TE-007)
@@ -188,6 +192,116 @@ class TestSessionTerminatorTermination:
         call_args = mock_client.destroy_kernel.call_args
         kernel_with_agent = terminating_session_mixed_agents.kernels[0]  # First kernel has agent
         assert call_args[0][0] == kernel_with_agent.kernel_id
+
+
+class TestCancelUnplacedKernels:
+    """TERMINATE cancels the PENDING kernels that were never placed on an agent."""
+
+    async def test_only_unplaced_pending_kernels_of_terminating_sessions_are_cancelled(
+        self,
+        terminator: SessionTerminator,
+        mock_repository: AsyncMock,
+        mock_valkey_schedule: AsyncMock,
+        terminating_kernel_factory: Callable[..., TerminatingKernelData],
+        terminating_session_factory: Callable[..., TerminatingSessionData],
+    ) -> None:
+        unplaced = terminating_kernel_factory()
+        unplaced.agent_id = None
+        unplaced.status = KernelStatus.PENDING
+        unplaced_not_pending = terminating_kernel_factory()
+        unplaced_not_pending.agent_id = None
+        unplaced_not_pending.status = KernelStatus.CANCELLED
+        placed = terminating_kernel_factory()
+        placed.status = KernelStatus.PENDING
+        session = terminating_session_factory(
+            kernels=[unplaced, unplaced_not_pending, placed], status_info="user-requested"
+        )
+        mock_repository.update_kernel_status_cancelled = AsyncMock(return_value=True)
+
+        cancelled = await terminator.cancel_unplaced_kernels([session])
+
+        assert cancelled == [unplaced.kernel_id]
+        mock_repository.update_kernel_status_cancelled.assert_awaited_once_with(
+            unplaced.kernel_id, "user-requested"
+        )
+        mock_valkey_schedule.mark_schedules_needed_batch.assert_awaited_once_with([
+            ScheduleType.CHECK_TERMINATING_PROGRESS.value
+        ])
+
+    async def test_a_session_that_is_not_terminating_is_left_alone(
+        self,
+        terminator: SessionTerminator,
+        mock_repository: AsyncMock,
+        mock_valkey_schedule: AsyncMock,
+        terminating_kernel_factory: Callable[..., TerminatingKernelData],
+        terminating_session_factory: Callable[..., TerminatingSessionData],
+    ) -> None:
+        unplaced = terminating_kernel_factory()
+        unplaced.agent_id = None
+        unplaced.status = KernelStatus.PENDING
+        session = terminating_session_factory(kernels=[unplaced])
+        session.status = SessionStatus.RESCHEDULING
+
+        assert await terminator.cancel_unplaced_kernels([session]) == []
+        mock_repository.update_kernel_status_cancelled.assert_not_awaited()
+        mock_valkey_schedule.mark_schedules_needed_batch.assert_not_awaited()
+
+    async def test_a_kernel_the_guard_refused_is_not_reported(
+        self,
+        terminator: SessionTerminator,
+        mock_repository: AsyncMock,
+        mock_valkey_schedule: AsyncMock,
+        terminating_kernel_factory: Callable[..., TerminatingKernelData],
+        terminating_session_factory: Callable[..., TerminatingSessionData],
+    ) -> None:
+        unplaced = terminating_kernel_factory()
+        unplaced.agent_id = None
+        unplaced.status = KernelStatus.PENDING
+        mock_repository.update_kernel_status_cancelled = AsyncMock(return_value=False)
+
+        assert (
+            await terminator.cancel_unplaced_kernels([
+                terminating_session_factory(kernels=[unplaced])
+            ])
+            == []
+        )
+        mock_valkey_schedule.mark_schedules_needed_batch.assert_not_awaited()
+
+
+class TestDestroyKernel:
+    async def test_destroy_reaches_the_agent(
+        self,
+        terminator: SessionTerminator,
+        mock_agent_client_pool: MagicMock,
+    ) -> None:
+        kernel_id = KernelId(uuid4())
+        session_id = SessionId(uuid4())
+
+        result = await terminator.destroy_kernel(
+            AgentId("agent-1"), kernel_id, session_id, "already-terminated"
+        )
+
+        assert result.success
+        mock_agent_client_pool.acquire.assert_called_once_with(AgentId("agent-1"))
+        mock_agent_client_pool._mock_client.destroy_kernel.assert_awaited_once_with(
+            kernel_id, session_id, "already-terminated", suppress_events=False
+        )
+
+    async def test_a_failed_destroy_is_returned_not_raised(
+        self,
+        terminator: SessionTerminator,
+        mock_agent_client_pool: MagicMock,
+    ) -> None:
+        mock_agent_client_pool._mock_client.destroy_kernel.side_effect = ConnectionError(
+            "agent unreachable"
+        )
+
+        result = await terminator.destroy_kernel(
+            AgentId("agent-1"), KernelId(uuid4()), SessionId(uuid4()), "already-terminated"
+        )
+
+        assert not result.success
+        assert result.error == "agent unreachable"
 
 
 # =============================================================================

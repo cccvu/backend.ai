@@ -624,3 +624,18 @@ class DBOperationFailed(BackendAIError, web.HTTPInternalServerError):
             operation=ErrorOperation.GENERIC,
             error_detail=ErrorDetail.INTERNAL_ERROR,
         )
+
+
+class LockNotAcquired(BackendAIError, web.HTTPConflict):
+    """Raised by a non-blocking lock acquisition when another holder has the lock."""
+
+    error_type = "https://api.backend.ai/probs/lock-not-acquired"
+    error_title = "The lock is held by another holder."
+
+    @override
+    def error_code(self) -> ErrorCode:
+        return ErrorCode(
+            domain=ErrorDomain.DATABASE,
+            operation=ErrorOperation.GENERIC,
+            error_detail=ErrorDetail.CONFLICT,
+        )

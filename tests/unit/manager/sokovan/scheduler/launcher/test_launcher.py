@@ -137,6 +137,47 @@ class TestSessionLauncherImagePulling:
         # Assert - Both agents were called despite failure
         assert mock_client.check_and_pull.await_count == 2
 
+    async def test_missing_image_config_does_not_block_the_group(
+        self,
+        launcher: SessionLauncher,
+        mock_agent_client_pool: MagicMock,
+        sessions_for_pull_multiple: list[SessionDataForPull],
+        image_config_default: dict[UUID, ImageConfigData],
+    ) -> None:
+        """A kernel whose image row is gone is skipped; the other sessions still pull.
+
+        Given: Two sessions on two agents, the first one's image config missing
+        When: Trigger image pulling
+        Then: No KeyError; only the second session's agent is asked to pull
+        """
+        missing_image_id = UUID("00000000-0000-0000-0000-0000000000ff")
+        broken, healthy = sessions_for_pull_multiple
+        broken.kernels[0].image_id = missing_image_id
+        assert missing_image_id not in image_config_default
+
+        session_ids = [s.session_id for s in sessions_for_pull_multiple]
+        with RecorderContext.scope("test", entity_ids=session_ids):
+            await launcher.trigger_image_pulling(
+                sessions_for_pull_multiple,
+                image_config_default,
+            )
+
+        mock_client = mock_agent_client_pool._mock_client
+        mock_client.check_and_pull.assert_awaited_once()
+        acquired = [call.args[0] for call in mock_agent_client_pool.acquire.call_args_list]
+        assert acquired == [healthy.kernels[0].agent_id]
+
+    async def test_only_missing_image_configs_pull_nothing(
+        self,
+        launcher: SessionLauncher,
+        mock_agent_client_pool: MagicMock,
+        session_for_pull_single_kernel: SessionDataForPull,
+    ) -> None:
+        """With every image config missing, nothing is pulled and nothing raises."""
+        await launcher.trigger_image_pulling([session_for_pull_single_kernel], {})
+
+        mock_agent_client_pool._mock_client.check_and_pull.assert_not_awaited()
+
 
 # =============================================================================
 # TestSessionLauncherKernelCreation (SC-LA-005 ~ SC-LA-008)
@@ -184,6 +225,27 @@ class TestSessionLauncherKernelCreation:
         call_args = mock_client.create_kernels.call_args
         kernel_ids = call_args[0][1]  # Second positional arg
         assert len(kernel_ids) == 1
+
+    async def test_missing_image_config_dispatches_nothing_and_does_not_raise(
+        self,
+        launcher: SessionLauncher,
+        mock_agent_client_pool: MagicMock,
+        mock_valkey_schedule: AsyncMock,
+        session_for_start_single_kernel: SessionDataForStart,
+        drain: Callable[[SessionLauncher], Awaitable[None]],
+    ) -> None:
+        """A pre-dispatch failure: no agent receives the kernels, and the pass goes on.
+
+        START still reports the session, which then sits in CREATING with its kernels
+        PREPARED until the stuck-start expiry ends it (see test_expire_stuck_starts.py).
+        """
+        session_ids = [session_for_start_single_kernel.session_id]
+        with RecorderContext.scope("test", entity_ids=session_ids):
+            await launcher.start_sessions_for_handler([session_for_start_single_kernel], {})
+        await drain(launcher)
+
+        mock_agent_client_pool._mock_client.create_kernels.assert_not_awaited()
+        mock_valkey_schedule.record_session_failed_agents.assert_awaited_once()
 
     async def test_multi_kernel_cluster_session(
         self,

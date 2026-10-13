@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 from collections.abc import Awaitable, Mapping, Sequence
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
@@ -17,6 +18,7 @@ from ai.backend.common.events.event_types.kernel.anycast import (
     KernelStartedAnycastEvent,
     KernelTerminatedAnycastEvent,
 )
+from ai.backend.common.events.event_types.kernel.types import KernelLifecycleEventReason
 from ai.backend.common.events.event_types.schedule.anycast import (
     DoSokovanProcessIfNeededEvent,
     DoSokovanProcessScheduleEvent,
@@ -27,7 +29,7 @@ from ai.backend.common.events.event_types.session.broadcast import (
 from ai.backend.common.events.types import AbstractBroadcastEvent
 from ai.backend.common.identifier.resource_group import ResourceGroupID
 from ai.backend.common.leader.tasks import EventTaskSpec
-from ai.backend.common.types import AccessKey, AgentId, SessionId
+from ai.backend.common.types import AccessKey, AgentId, KernelId, SessionId
 from ai.backend.logging import BraceStyleAdapter
 from ai.backend.manager.config.provider import ManagerConfigProvider
 from ai.backend.manager.data.kernel.types import KernelStatus
@@ -37,6 +39,8 @@ from ai.backend.manager.data.session.types import (
     StatusTransitions,
     TransitionStatus,
 )
+from ai.backend.manager.defs import LockID
+from ai.backend.manager.errors.resource import LockNotAcquired
 from ai.backend.manager.metrics.scheduler import SchedulerOperationMetricObserver
 from ai.backend.manager.models.kernel.conditions import KernelConditions
 from ai.backend.manager.models.scheduling_history.row import SessionSchedulingHistoryRow
@@ -237,6 +241,8 @@ class ScheduleCoordinator:
     async def process_lifecycle_schedule(
         self,
         schedule_type: ScheduleType,
+        *,
+        short_cycle: bool = False,
     ) -> bool:
         """Process a lifecycle schedule type using the DeploymentCoordinator pattern.
 
@@ -255,6 +261,8 @@ class ScheduleCoordinator:
 
         Args:
             schedule_type: Type of scheduling operation
+            short_cycle: Whether this is a short-cycle (mark-driven) tick; only
+                affects how a skipped tick is logged
 
         Returns:
             True if operation was performed, False otherwise
@@ -271,11 +279,15 @@ class ScheduleCoordinator:
 
         kernel_handler = self._handlers.kernel_handlers.get(schedule_type)
         if kernel_handler:
-            return await self._process_kernel_schedule(schedule_type, kernel_handler)
+            return await self._process_kernel_schedule(
+                schedule_type, kernel_handler, short_cycle=short_cycle
+            )
 
         lifecycle_handler = self._handlers.lifecycle_handlers.get(schedule_type)
         if lifecycle_handler:
-            return await self._process_lifecycle_handler_schedule(schedule_type, lifecycle_handler)
+            return await self._process_lifecycle_handler_schedule(
+                schedule_type, lifecycle_handler, short_cycle=short_cycle
+            )
 
         cleanup_handler = self._handlers.cleanup_handlers.get(schedule_type)
         if cleanup_handler:
@@ -288,22 +300,21 @@ class ScheduleCoordinator:
         self,
         schedule_type: ScheduleType,
         handler: SessionLifecycleHandler,
+        *,
+        short_cycle: bool = False,
     ) -> bool:
         """Process a lifecycle handler schedule type."""
         try:
             log.debug("Processing lifecycle schedule type: {}", schedule_type.value)
 
             async with AsyncExitStack() as stack:
-                stack.enter_context(self._operation_metrics.measure_operation(handler.name()))
+                # Take the lock (if any) without waiting, before measuring the pass.
+                if handler.lock_id is not None and not await self._enter_tick_lock(
+                    stack, handler.lock_id, schedule_type, handler.name(), short_cycle
+                ):
+                    return False
 
-                # Acquire lock if needed
-                if handler.lock_id is not None:
-                    lock_lifetime = (
-                        self._config_provider.config.manager.session_schedule_lock_lifetime
-                    )
-                    await stack.enter_async_context(
-                        self._lock_factory(handler.lock_id, lock_lifetime)
-                    )
+                stack.enter_context(self._operation_metrics.measure_operation(handler.name()))
 
                 # Process each resource group in parallel
                 resource_group_ids = await self._repository.get_all_resource_groups()
@@ -335,6 +346,70 @@ class ScheduleCoordinator:
                 e,
             )
             raise
+
+    async def _enter_tick_lock(
+        self,
+        stack: AsyncExitStack,
+        lock_id: LockID,
+        schedule_type: ScheduleType,
+        operation: str,
+        short_cycle: bool,
+    ) -> bool:
+        """Enter the pass's lock on ``stack`` without waiting for it.
+
+        A tick never waits for another holder of its lock: waiting would keep
+        a database connection and an event handler busy for as long as the
+        other pass runs. When the lock is taken, the tick is skipped and the
+        schedule type is marked again, so that a later short-cycle tick runs
+        the pass once the holder is done.
+
+        Returns:
+            True if the lock was acquired, False if the tick was skipped.
+        """
+        lock_lifetime = self._config_provider.config.manager.session_schedule_lock_lifetime
+        started_at = time.perf_counter()
+        try:
+            await stack.enter_async_context(
+                self._lock_factory(lock_id, lock_lifetime, blocking=False)
+            )
+        except LockNotAcquired:
+            await self._skip_locked_tick(
+                schedule_type,
+                operation,
+                short_cycle,
+                time.perf_counter() - started_at,
+            )
+            return False
+        return True
+
+    async def _skip_locked_tick(
+        self,
+        schedule_type: ScheduleType,
+        operation: str,
+        short_cycle: bool,
+        duration: float,
+    ) -> None:
+        """Record a tick skipped because its lock is held, and request a retry.
+
+        Never raises: a failure to mark the schedule type again is logged.
+        """
+        self._operation_metrics.observe_operation(
+            operation=operation, status="skipped", duration=duration
+        )
+        try:
+            await self._scheduling_controller.mark_scheduling_needed([schedule_type])
+        except Exception as e:
+            log.warning(
+                "Failed to request {} again after skipping a locked tick: {!r}",
+                schedule_type.value,
+                e,
+            )
+        log.log(
+            logging.DEBUG if short_cycle else logging.INFO,
+            "Skipped {} ({} cycle): its lock is held by another pass",
+            schedule_type.value,
+            "short" if short_cycle else "long",
+        )
 
     async def _process_promotion_schedule(
         self,
@@ -388,6 +463,8 @@ class ScheduleCoordinator:
         self,
         schedule_type: ScheduleType,
         handler: KernelLifecycleHandler,
+        *,
+        short_cycle: bool = False,
     ) -> bool:
         """Process a kernel handler schedule type.
 
@@ -401,16 +478,13 @@ class ScheduleCoordinator:
             log.debug("Processing kernel schedule type: {}", schedule_type.value)
 
             async with AsyncExitStack() as stack:
-                stack.enter_context(self._operation_metrics.measure_operation(handler.name()))
+                # Take the lock (if any) without waiting, before measuring the pass.
+                if handler.lock_id is not None and not await self._enter_tick_lock(
+                    stack, handler.lock_id, schedule_type, handler.name(), short_cycle
+                ):
+                    return False
 
-                # Acquire lock if needed
-                if handler.lock_id is not None:
-                    lock_lifetime = (
-                        self._config_provider.config.manager.session_schedule_lock_lifetime
-                    )
-                    await stack.enter_async_context(
-                        self._lock_factory(handler.lock_id, lock_lifetime)
-                    )
+                stack.enter_context(self._operation_metrics.measure_operation(handler.name()))
 
                 # Process each resource group in parallel
                 resource_group_ids = await self._repository.get_all_resource_groups()
@@ -963,7 +1037,7 @@ class ScheduleCoordinator:
         if sessions_to_transition:
             # Create TransitionStatus with kernel=None (promotion doesn't change kernel status)
             transition = TransitionStatus(session=to_status, kernel=None)
-            await self._apply_transition(
+            moved = await self._apply_transition(
                 spec.name,
                 sessions_to_transition,
                 transition,
@@ -972,8 +1046,10 @@ class ScheduleCoordinator:
                 current_time,
             )
 
-            # Broadcast events for successful transitions
-            await self._broadcast_transition_events(sessions_to_transition, to_status)
+            # Broadcast events only for the sessions that actually moved
+            await self._broadcast_transition_events(
+                [s for s in sessions_to_transition if s.session_id in moved], to_status
+            )
 
     async def _execute_transition_hooks(
         self,
@@ -987,6 +1063,10 @@ class ScheduleCoordinator:
         their full session data (for occupied_slots calculation on RUNNING transition).
 
         All hooks are blocking - if a hook fails, the session won't transition.
+
+        Only the sessions still in the status they were read in are fetched:
+        a session that moved in the meantime (for example, was terminated)
+        gets no hook and no transition.
 
         Args:
             session_infos: Sessions to execute hooks for
@@ -1004,12 +1084,16 @@ class ScheduleCoordinator:
         session_ids = [s.session_id for s in session_infos]
         querier = BatchQuerier(
             pagination=NoPagination(),
-            conditions=[SessionConditions.by_ids(session_ids)],
+            conditions=[
+                SessionConditions.by_expected_statuses({
+                    s.session_id: s.from_status for s in session_infos
+                })
+            ],
         )
         full_sessions = await self._repository.search_sessions_with_kernels_for_handler(querier)
 
         if not full_sessions:
-            log.warning(
+            log.debug(
                 "No full session data found for {} sessions transitioning to {}",
                 len(session_ids),
                 target_status,
@@ -1154,7 +1238,7 @@ class ScheduleCoordinator:
 
         # SUCCESS transitions
         if transitions.success and result.successes:
-            await self._apply_transition(
+            moved = await self._apply_transition(
                 handler_name,
                 result.successes,
                 transitions.success,
@@ -1162,10 +1246,11 @@ class ScheduleCoordinator:
                 records,
                 current_time,
             )
-            # Broadcast events for successful transitions
+            # Broadcast events only for the sessions that actually moved
             if transitions.success.session:
                 await self._broadcast_transition_events(
-                    result.successes, transitions.success.session
+                    [s for s in result.successes if s.session_id in moved],
+                    transitions.success.session,
                 )
 
         # FAILURE transitions - Coordinator classifies failures into give_up/expired/need_retry.
@@ -1313,8 +1398,14 @@ class ScheduleCoordinator:
         scheduling_result: SchedulingResult,
         records: Mapping[SessionId, ExecutionRecord],
         status_changed_at: datetime,
-    ) -> None:
+    ) -> set[SessionId]:
         """Apply a single transition type to sessions (BEP-1030).
+
+        Each session moves only while it is still in the status it was read
+        in (``SessionTransitionInfo.from_status``). A session that moved in
+        the meantime, for example one a user terminated while the handler
+        ran, is left as it is: it gets no history row, and the kernel reset
+        below skips it. Callers broadcast only for the returned sessions.
 
         Args:
             handler_name: Name of the handler for logging and history
@@ -1323,11 +1414,16 @@ class ScheduleCoordinator:
             scheduling_result: Result type for history recording
             records: Mapping of session IDs to their execution records
             status_changed_at: Database timestamp for status change
+
+        Returns:
+            IDs of the sessions that moved. When the transition leaves the
+            session status alone, every given session counts as moved.
         """
         if not session_infos:
-            return
+            return set()
 
         session_ids = [s.session_id for s in session_infos]
+        moved: set[SessionId] = set(session_ids)
 
         # Session status update
         if transition.session:
@@ -1335,9 +1431,18 @@ class ScheduleCoordinator:
                 spec=SessionStatusBatchUpdaterSpec(
                     to_status=transition.session,
                     status_changed_at=status_changed_at,
-                    reason="" if transition.session == SessionStatus.RUNNING else None,
+                    reason=(
+                        transition.status_info
+                        if transition.status_info is not None
+                        else ("" if transition.session == SessionStatus.RUNNING else None)
+                    ),
                 ),
-                conditions=[SessionConditions.by_ids(session_ids)],
+                conditions=[
+                    SessionConditions.by_ids(session_ids),
+                    SessionConditions.by_expected_statuses({
+                        info.session_id: info.from_status for info in session_infos
+                    }),
+                ],
             )
             history_specs = [
                 SessionSchedulingHistoryCreatorSpec(
@@ -1352,20 +1457,36 @@ class ScheduleCoordinator:
                 )
                 for info in session_infos
             ]
-            updated = await self._repository.update_with_history(
-                updater, BulkCreator(specs=history_specs)
+            moved = set(
+                await self._repository.update_with_history(
+                    updater, BulkCreator(specs=history_specs)
+                )
             )
+            if len(moved) < len(session_ids):
+                log.info(
+                    "{}: {} of {} sessions left the status they were read in; "
+                    "not moving them to {} ({})",
+                    handler_name,
+                    len(session_ids) - len(moved),
+                    len(session_ids),
+                    transition.session,
+                    scheduling_result.value,
+                )
             log.debug(
                 "{}: Updated {} sessions to {} ({})",
                 handler_name,
-                updated,
+                len(moved),
                 transition.session,
                 scheduling_result.value,
             )
 
         # Kernel status reset if transitioning to PENDING
         if transition.kernel == KernelStatus.PENDING:
-            await self._apply_kernel_pending_resets(handler_name, session_ids)
+            await self._apply_kernel_pending_resets(
+                handler_name, [session_id for session_id in session_ids if session_id in moved]
+            )
+
+        return moved
 
     async def _apply_kernel_pending_resets(
         self,
@@ -1593,7 +1714,7 @@ class ScheduleCoordinator:
         if not await self._valkey_schedule.load_and_delete_schedule_mark(schedule_type.value):
             return False
 
-        return await self.process_schedule(schedule_type)
+        return await self.process_lifecycle_schedule(schedule_type, short_cycle=True)
 
     # Kernel event handling methods using the coordinator's kernel state engine
 
@@ -1611,8 +1732,23 @@ class ScheduleCoordinator:
         """Handle kernel creating event through the kernel state engine."""
         return await self._kernel_state_engine.mark_kernel_creating(event.kernel_id, event.reason)
 
-    async def handle_kernel_running(self, event: KernelStartedAnycastEvent) -> bool:
-        """Handle kernel running event through the kernel state engine."""
+    async def handle_kernel_running(
+        self,
+        event: KernelStartedAnycastEvent,
+        *,
+        source: AgentId,
+    ) -> bool:
+        """Handle kernel running event through the kernel state engine.
+
+        A kernel that already reached a terminal status cannot become RUNNING.
+        When its start is reported anyway, by the agent the kernel is placed
+        on, the container it reports would run with nothing left to stop it,
+        so it is destroyed (see :meth:`_destroy_kernel_started_after_termination`).
+
+        Args:
+            event: The kernel started event
+            source: The agent that sent the event
+        """
         # Convert event data to dataclass (always present, may be empty)
         creation_info = KernelCreationInfo.from_dict(dict(event.creation_info))
         result = await self._kernel_state_engine.mark_kernel_running(
@@ -1625,7 +1761,86 @@ class ScheduleCoordinator:
             await self._scheduling_controller.mark_scheduling_needed([
                 ScheduleType.CHECK_CREATING_PROGRESS,
             ])
+        else:
+            await self._destroy_kernel_started_after_termination(event.kernel_id, source)
         return result
+
+    async def _destroy_kernel_started_after_termination(
+        self,
+        kernel_id: KernelId,
+        source: AgentId,
+    ) -> None:
+        """Destroy a kernel whose start was reported after it was terminated.
+
+        The destroy is sent only when all of these hold, so that a late or
+        stray event can never destroy a live kernel:
+
+        - the kernel is in a terminal status;
+        - its session is TERMINATING or terminal (a kernel id is reused for a
+          new placement only while its session is still live);
+        - the kernel has an agent, and the event came from that agent.
+
+        The rows are read first and the database connection is released
+        before the agent is called. The destroy is bounded and never raises.
+        """
+        try:
+            kernel_result = await self._repository.search_kernels_for_handler(
+                BatchQuerier(
+                    pagination=NoPagination(),
+                    conditions=[KernelConditions.by_id(kernel_id)],
+                )
+            )
+            if not kernel_result.items:
+                return
+            kernel = kernel_result.items[0]
+            if kernel.lifecycle.status not in KernelStatus.terminal_statuses():
+                return
+            agent = kernel.resource.agent
+            if not agent or agent != source:
+                return
+            session_id = SessionId(UUID(str(kernel.session.session_id)))
+            session_infos = await self._repository.search_sessions_for_handler(
+                BatchQuerier(
+                    pagination=NoPagination(),
+                    conditions=[SessionConditions.by_ids([session_id])],
+                )
+            )
+            if not session_infos:
+                return
+            session_status = session_infos[0].lifecycle.status
+            if (
+                session_status != SessionStatus.TERMINATING
+                and session_status not in SessionStatus.terminal_statuses()
+            ):
+                return
+            log.warning(
+                "Kernel {} of session {} ({}) was reported started by agent {} after it "
+                "reached {}; destroying it",
+                kernel_id,
+                session_id,
+                session_status,
+                agent,
+                kernel.lifecycle.status,
+            )
+            destroy_result = await self._components.terminator.destroy_kernel(
+                AgentId(agent),
+                kernel_id,
+                session_id,
+                KernelLifecycleEventReason.ALREADY_TERMINATED.value,
+            )
+            if not destroy_result.success:
+                log.warning(
+                    "Could not destroy kernel {} on agent {}: {}",
+                    kernel_id,
+                    agent,
+                    destroy_result.error,
+                )
+        except Exception as e:
+            log.warning(
+                "Failed to check kernel {} reported started after termination: {!r}",
+                kernel_id,
+                e,
+            )
 
     async def handle_kernel_preparing(self, event: KernelPreparingAnycastEvent) -> bool:
         """Handle kernel preparing event through the kernel state engine."""
@@ -1779,9 +1994,11 @@ class ScheduleCoordinator:
                 initial_delay=30.0,
             ),
             # Sweep stale kernels - maintenance task to clean up kernels with stale presence
+            # It shares the TERMINATING lock with TERMINATE, so a tick skipped while
+            # that lock is held marks it again; the short-cycle task consumes the mark.
             SchedulerTaskSpec(
                 ScheduleType.SWEEP_STALE_KERNELS,
-                short_interval=None,  # No short-cycle task for maintenance
+                short_interval=2.0,
                 long_interval=60.0,
                 initial_delay=30.0,
             ),
@@ -1824,6 +2041,14 @@ class ScheduleCoordinator:
                 short_interval=2.0,
                 long_interval=60.0,
                 initial_delay=30.0,
+            ),
+            # Expire sessions stuck while starting - maintenance task, long cycle only.
+            # The initial delay lets event backlogs drain after a manager restart.
+            SchedulerTaskSpec(
+                ScheduleType.EXPIRE_STUCK_STARTS,
+                short_interval=None,
+                long_interval=60.0,
+                initial_delay=300.0,
             ),
         ]
 

@@ -117,7 +117,9 @@ class SessionLauncher:
     Orchestrates:
     1. Prepare: SCHEDULED -> PREPARING (image pulling)
     2. Start: PREPARED -> CREATING (kernel creation)
-    3. Retry operations for stuck sessions
+
+    It does not retry or expire stuck sessions: the EXPIRE_STUCK_STARTS maintenance handler
+    ends a session stuck in a starting status past its bound.
     """
 
     _repository: SchedulerRepository
@@ -203,8 +205,21 @@ class SessionLauncher:
             for kernel in session.kernels:
                 agent_id = kernel.agent_id
                 if agent_id and kernel.image_id is not None:
-                    # Image config must exist since we queried based on kernels
-                    img_cfg = image_configs[kernel.image_id]
+                    img_cfg = image_configs.get(kernel.image_id)
+                    if img_cfg is None:
+                        # The image row is gone (e.g. deleted after the session was
+                        # scheduled). Skip the kernel so the rest of the group still pulls;
+                        # its session cannot start and the stuck-start expiry ends it.
+                        log.warning(
+                            "Skipping image pull for kernel {} of session {} on agent {}:"
+                            " image {} (id={}) not found",
+                            kernel.kernel_id,
+                            session.session_id,
+                            agent_id,
+                            kernel.image,
+                            kernel.image_id,
+                        )
+                        continue
 
                     # Convert ImageConfigData to ImageConfig format
                     # Use canonical as key for agent_image_configs to avoid duplicates
@@ -541,8 +556,9 @@ class SessionLauncher:
             # Convert exception to error status info
             error_info = convert_to_status_data(e, self._config_provider.config.debug.enabled)
             log.warning(log_fmt + "failed-starting", *log_args, exc_info=True)
-            # Update error info in status_data without changing status
-            # Session will be handled by timeout detection in Coordinator
+            # Update error info in status_data without changing status.
+            # The session stays in CREATING until the stuck-start expiry
+            # (EXPIRE_STUCK_STARTS) moves it to TERMINATING.
             await self._repository.update_session_error_info(session.session_id, error_info)
 
     async def _finish_kernel_creation(
@@ -745,9 +761,12 @@ class SessionLauncher:
 
                 network_plugin = self._network_plugin_ctx.plugins[driver]
                 try:
-                    network_info = await network_plugin.create_network(
-                        identifier=str(session.session_id)
-                    )
+                    # Bounded like the other network RPCs: this runs under the
+                    # START lock, which must not be held by an unbounded await.
+                    async with asyncio.timeout(AGENT_NETWORK_RPC_TIMEOUT_SEC):
+                        network_info = await network_plugin.create_network(
+                            identifier=str(session.session_id)
+                        )
                     network_config = dict(network_info.options)
                     network_name = network_info.network_id
                 except Exception:

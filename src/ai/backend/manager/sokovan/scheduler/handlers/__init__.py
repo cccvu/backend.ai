@@ -11,6 +11,7 @@ from .lifecycle.reschedule_sessions import RescheduleSessionsLifecycleHandler
 from .lifecycle.schedule_sessions import ScheduleSessionsLifecycleHandler
 from .lifecycle.start_sessions import StartSessionsLifecycleHandler
 from .lifecycle.terminate_sessions import TerminateSessionsLifecycleHandler
+from .maintenance.expire_stuck_starts import ExpireStuckStartsLifecycleHandler
 from .maintenance.sweep_sessions import SweepSessionsLifecycleHandler
 
 __all__ = [
@@ -18,6 +19,7 @@ __all__ = [
     "SessionLifecycleHandler",
     "CheckPreconditionLifecycleHandler",
     "DeprioritizeSessionsLifecycleHandler",
+    "ExpireStuckStartsLifecycleHandler",
     "PreemptSessionsLifecycleHandler",
     "ReleaseReservedSessionsLifecycleHandler",
     "RescheduleSessionsLifecycleHandler",

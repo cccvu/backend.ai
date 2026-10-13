@@ -57,6 +57,7 @@ from ai.backend.manager.data.session.types import (
     SessionStatus,
 )
 from ai.backend.manager.defs import LockID
+from ai.backend.manager.errors.resource import LockNotAcquired
 from ai.backend.manager.models.network import NetworkType
 from ai.backend.manager.repositories.scheduling_history.creators import (
     SessionSchedulingHistoryCreatorSpec,
@@ -231,6 +232,11 @@ def _search_result(sessions: Sequence[_PreparedSession]) -> SessionWithKernelsAn
     )
 
 
+def _moved_session_ids(updater: Any, bulk_creator: Any) -> list[SessionId]:
+    """Every session the update was asked for moves, as a mocked commit."""
+    return [spec.session_id for spec in bulk_creator.specs]
+
+
 def _committed_session_ids(update_with_history: AsyncMock) -> list[set[SessionId]]:
     """Session ids each ``update_with_history`` call moved to CREATING."""
     committed: list[set[SessionId]] = []
@@ -257,15 +263,21 @@ class _RecordingLock(AbstractDistributedLock):
     _lock: asyncio.Lock
     _holds: list[float]
     _acquired_at: float
+    _blocking: bool
 
-    def __init__(self, lock: asyncio.Lock, holds: list[float], lifetime: float) -> None:
+    def __init__(
+        self, lock: asyncio.Lock, holds: list[float], lifetime: float, *, blocking: bool
+    ) -> None:
         super().__init__(lifetime=lifetime)
         self._lock = lock
         self._holds = holds
         self._acquired_at = 0.0
+        self._blocking = blocking
 
     @override
     async def __aenter__(self) -> None:
+        if not self._blocking and self._lock.locked():
+            raise LockNotAcquired()
         await self._lock.acquire()
         self._acquired_at = time.monotonic()
 
@@ -279,15 +291,22 @@ class _RecordingLockFactory:
     """``DistributedLockFactory`` over one ``asyncio.Lock`` per lock id."""
 
     holds: dict[LockID, list[float]]
+    blocking_modes: list[bool]
     _locks: dict[LockID, asyncio.Lock]
 
     def __init__(self) -> None:
         self.holds = {}
+        self.blocking_modes = []
         self._locks = {}
 
-    def __call__(self, lock_id: LockID, lifetime_hint: float) -> AbstractDistributedLock:
+    def __call__(
+        self, lock_id: LockID, lifetime_hint: float, *, blocking: bool = True
+    ) -> AbstractDistributedLock:
+        self.blocking_modes.append(blocking)
         lock = self._locks.setdefault(lock_id, asyncio.Lock())
-        return _RecordingLock(lock, self.holds.setdefault(lock_id, []), lifetime_hint)
+        return _RecordingLock(
+            lock, self.holds.setdefault(lock_id, []), lifetime_hint, blocking=blocking
+        )
 
 
 class _KernelCreationInProgress(Exception):
@@ -351,7 +370,7 @@ def repository() -> AsyncMock:
     repository.get_all_resource_groups = AsyncMock(return_value=[RESOURCE_GROUP])
     repository.get_last_session_histories = AsyncMock(return_value={})
     repository.get_db_now = AsyncMock(side_effect=lambda: datetime.now(tzutc()))
-    repository.update_with_history = AsyncMock(return_value=1)
+    repository.update_with_history = AsyncMock(side_effect=_moved_session_ids)
     repository.update_session_network_id = AsyncMock(return_value=None)
     repository.update_session_error_info = AsyncMock(return_value=None)
     repository.invalidate_kernel_related_cache = AsyncMock(return_value=None)
@@ -506,9 +525,9 @@ class TestStartLockHold:
         ]
         sent_at_commit: list[tuple[set[KernelId], int]] = []
 
-        async def commit(*args: Any) -> int:
+        async def commit(*args: Any) -> list[SessionId]:
             sent_at_commit.append((set(hung_agent.in_flight), ok_agent.await_count))
-            return 1
+            return _moved_session_ids(*args)
 
         repository.update_with_history.side_effect = commit
         try:
@@ -538,6 +557,8 @@ class TestStartLockHold:
             holds = lock_factory.holds[LockID.LOCKID_SOKOVAN_TARGET_CREATING]
             assert len(holds) == 2
             assert all(hold < PASS_BOUND_SEC for hold in holds)
+            # A tick never waits for the lock.
+            assert lock_factory.blocking_modes == [False, False]
             repository.update_session_error_info.assert_not_awaited()
         finally:
             await _close_and_check(launcher)
@@ -568,11 +589,11 @@ class TestStartLockHold:
         ]
         in_flight_at_commit: list[set[KernelId]] = []
 
-        async def commit(*args: Any) -> int:
+        async def commit(*args: Any) -> list[SessionId]:
             in_flight_at_commit.append(set(guarded_agent.in_flight))
             if len(in_flight_at_commit) == 1:
                 raise ConnectionError("database unavailable")
-            return 1
+            return _moved_session_ids(*args)
 
         repository.update_with_history.side_effect = commit
         failure_recorded = asyncio.Event()

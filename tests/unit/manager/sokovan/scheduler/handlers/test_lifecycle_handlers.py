@@ -5,13 +5,14 @@ Based on BEP-1033 test scenarios for handler-level testing.
 Test Scenarios:
 - SC-SS-001 ~ SC-SS-005: ScheduleSessionsLifecycleHandler
 - SC-CP-001 ~ SC-CP-006: CheckPreconditionLifecycleHandler
-- SC-ST-001 ~ SC-ST-005: StartSessionsLifecycleHandler
+- SC-ST-001 ~ SC-ST-007: StartSessionsLifecycleHandler
 - SC-TE-001 ~ SC-TE-005: TerminateSessionsLifecycleHandler
 """
 
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import time
 import uuid
 from collections.abc import Callable
@@ -21,7 +22,8 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from ai.backend.common.identifier.resource_group import ResourceGroupID
-from ai.backend.common.types import AgentId, SessionId
+from ai.backend.common.types import AgentId, KernelId, SessionId
+from ai.backend.manager.data.kernel.types import KernelStatus
 from ai.backend.manager.data.session.types import SessionStatus
 from ai.backend.manager.sokovan.recorder.context import RecorderContext
 from ai.backend.manager.sokovan.scheduler.handlers.lifecycle.check_precondition import (
@@ -741,6 +743,81 @@ class TestStartSessionsLifecycleHandler:
         # Assert
         assert len(result.successes) == 1
         assert result.successes[0].session_id == prepared_session.session_info.identity.id
+
+    async def test_sessions_with_kernels_past_prepared_are_skipped_not_sent(
+        self,
+        handler: StartSessionsLifecycleHandler,
+        mock_launcher: AsyncMock,
+        mock_repository: AsyncMock,
+        prepared_sessions_multiple: list[SessionWithKernels],
+        prepared_session: SessionWithKernels,
+        sessions_for_start_factory: Callable[..., SessionsForStartWithImages],
+    ) -> None:
+        """SC-ST-006: A session already (partly) sent is skipped, not sent again.
+
+        Given: three PREPARED sessions: one whose kernel is RUNNING, one with a
+            PREPARED kernel and a CREATING one, and one whose kernel has no status
+        When: Handler starts them
+        Then: Only the last is sent and reported as success; the others are
+            reported as skipped and sent nowhere
+        """
+        running, partial = prepared_sessions_multiple
+        sessions = [running, partial, prepared_session]
+        sessions_for_start = sessions_for_start_factory(sessions)
+        running_data, partial_data, fresh_data = sessions_for_start.sessions
+        running_data.kernels = [
+            dataclasses.replace(kernel, status=KernelStatus.RUNNING)
+            for kernel in running_data.kernels
+        ]
+        (partial_kernel,) = partial_data.kernels
+        partial_data.kernels = [
+            dataclasses.replace(partial_kernel, status=KernelStatus.PREPARED),
+            dataclasses.replace(
+                partial_kernel, kernel_id=KernelId(uuid.uuid4()), status=KernelStatus.CREATING
+            ),
+        ]
+        assert all(kernel.status is None for kernel in fresh_data.kernels)
+        mock_repository.search_sessions_with_kernels_and_user.return_value = sessions_for_start
+
+        result = await handler.execute(ResourceGroupID(uuid.uuid4()), sessions)
+
+        mock_launcher.start_sessions_for_handler.assert_awaited_once_with(
+            [fresh_data], sessions_for_start.image_configs
+        )
+        assert [s.session_id for s in result.successes] == [
+            prepared_session.session_info.identity.id
+        ]
+        assert [s.session_id for s in result.skipped] == [
+            running.session_info.identity.id,
+            partial.session_info.identity.id,
+        ]
+        assert {s.reason for s in result.skipped} == {"kernels-already-started"}
+        assert result.failures == []
+
+    async def test_a_session_still_short_of_prepared_is_sent(
+        self,
+        handler: StartSessionsLifecycleHandler,
+        mock_launcher: AsyncMock,
+        mock_repository: AsyncMock,
+        prepared_session: SessionWithKernels,
+        sessions_for_start_factory: Callable[..., SessionsForStartWithImages],
+    ) -> None:
+        """SC-ST-007: Only statuses past PREPARED stop a start."""
+        sessions_for_start = sessions_for_start_factory([prepared_session])
+        (session_data,) = sessions_for_start.sessions
+        session_data.kernels = [
+            dataclasses.replace(kernel, status=KernelStatus.PULLING)
+            for kernel in session_data.kernels
+        ]
+        mock_repository.search_sessions_with_kernels_and_user.return_value = sessions_for_start
+
+        result = await handler.execute(ResourceGroupID(uuid.uuid4()), [prepared_session])
+
+        mock_launcher.start_sessions_for_handler.assert_awaited_once_with(
+            [session_data], sessions_for_start.image_configs
+        )
+        assert len(result.successes) == 1
+        assert result.skipped == []
 
 
 # =============================================================================

@@ -33,3 +33,4 @@ class ScheduleType(StrEnum):
     CLEANUP_FORCE_TERMINATED = (
         "cleanup_force_terminated"  # Cleanup containers for force-terminated sessions
     )
+    EXPIRE_STUCK_STARTS = "expire_stuck_starts"  # Terminate sessions stuck past their start bounds

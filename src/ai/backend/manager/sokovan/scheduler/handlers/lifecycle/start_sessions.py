@@ -7,7 +7,7 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING, override
 
 from ai.backend.common.identifier.resource_group import ResourceGroupID
-from ai.backend.common.types import AccessKey
+from ai.backend.common.types import AccessKey, SessionId
 from ai.backend.logging import BraceStyleAdapter
 from ai.backend.manager.data.kernel.types import KernelStatus
 from ai.backend.manager.data.session.types import SessionStatus, StatusTransitions, TransitionStatus
@@ -20,12 +20,18 @@ from ai.backend.manager.sokovan.scheduler.results import (
     SessionExecutionResult,
     SessionTransitionInfo,
 )
-from ai.backend.manager.views.sokovan.lifecycle import SessionWithKernels
+from ai.backend.manager.views.sokovan.lifecycle import SessionDataForStart, SessionWithKernels
 
 if TYPE_CHECKING:
     from ai.backend.manager.sokovan.scheduler.launcher.launcher import SessionLauncher
 
 log = BraceStyleAdapter(logging.getLogger(__name__))
+
+# Kernel statuses up to PREPARED: a kernel in any of them has not been sent to
+# an agent for creation yet. A kernel without a status counts as PREPARED.
+_NOT_YET_STARTED_STATUSES: frozenset[KernelStatus] = KernelStatus.pre_prepared_statuses() | {
+    KernelStatus.PREPARED
+}
 
 
 class StartSessionsLifecycleHandler(SessionLifecycleHandler):
@@ -111,8 +117,10 @@ class StartSessionsLifecycleHandler(SessionLifecycleHandler):
         The coordinator provides SessionWithKernels data.
         This handler:
         1. Extracts session IDs from SessionWithKernels
-        2. Queries Repository for additional data (SessionDataForStart + ImageConfigData)
-        3. Starts kernels on agents via Launcher
+        2. Queries Repository for additional data (SessionDataForStart + ImageConfigData),
+           keeping only the sessions that are still PREPARED
+        3. Skips a session any of whose kernels is already past PREPARED
+        4. Starts kernels on agents via Launcher
         """
         result = SessionExecutionResult()
 
@@ -123,26 +131,68 @@ class StartSessionsLifecycleHandler(SessionLifecycleHandler):
         session_ids = [s.session_info.identity.id for s in sessions]
 
         # Query Repository for additional data needed by Launcher
-        # Use search_sessions_with_kernels_and_user to get user info for session start
+        # Use search_sessions_with_kernels_and_user to get user info for session start.
+        # A session that left PREPARED since the coordinator read it (for example,
+        # one being terminated) is neither started nor reported.
         querier = BatchQuerier(
             pagination=NoPagination(),
-            conditions=[SessionConditions.by_ids(session_ids)],
+            conditions=[
+                SessionConditions.by_ids(session_ids),
+                SessionConditions.by_statuses([SessionStatus.PREPARED]),
+            ],
         )
         sessions_data = await self._repository.search_sessions_with_kernels_and_user(querier)
+
+        # A session with a kernel already past PREPARED was sent before. Sending it
+        # again could re-create a kernel that is running or build a split cluster,
+        # so it is skipped and left for the session expiry to end.
+        to_start: list[SessionDataForStart] = []
+        already_sent_ids: set[SessionId] = set()
+        for session_data in sessions_data.sessions:
+            started_kernels = [
+                kernel
+                for kernel in session_data.kernels
+                if kernel.status is not None and kernel.status not in _NOT_YET_STARTED_STATUSES
+            ]
+            if started_kernels:
+                already_sent_ids.add(session_data.session_id)
+                log.warning(
+                    "start-session(s:{}): not sent again, {} of its kernels are past PREPARED ({})",
+                    session_data.session_id,
+                    len(started_kernels),
+                    ", ".join(sorted({str(kernel.status) for kernel in started_kernels})),
+                )
+                continue
+            to_start.append(session_data)
+        started_ids = {session_data.session_id for session_data in to_start}
 
         # Start kernels on agents via Launcher
         # Note: RecorderContext is handled inside Launcher
         await self._launcher.start_sessions_for_handler(
-            sessions_data.sessions,
+            to_start,
             sessions_data.image_configs,
         )
 
-        # Mark all sessions as success for status transition
+        # Mark the started sessions as success for status transition
         for session in sessions:
             session_info = session.session_info
+            session_id = session_info.identity.id
+            if session_id in already_sent_ids:
+                result.skipped.append(
+                    SessionTransitionInfo(
+                        session_id=session_id,
+                        from_status=session_info.lifecycle.status,
+                        reason="kernels-already-started",
+                        creation_id=session_info.identity.creation_id,
+                        access_key=AccessKey(session_info.metadata.access_key),
+                    )
+                )
+                continue
+            if session_id not in started_ids:
+                continue
             result.successes.append(
                 SessionTransitionInfo(
-                    session_id=session_info.identity.id,
+                    session_id=session_id,
                     from_status=session_info.lifecycle.status,
                     reason="triggered-by-scheduler",
                     creation_id=session_info.identity.creation_id,

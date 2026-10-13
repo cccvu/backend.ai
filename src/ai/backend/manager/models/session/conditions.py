@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Collection
+from collections import defaultdict
+from collections.abc import Collection, Mapping
 from datetime import datetime
 from typing import TYPE_CHECKING
 
@@ -42,6 +43,33 @@ class SessionConditions:
     def by_statuses(statuses: Collection[SessionStatus]) -> QueryCondition:
         def inner() -> sa.sql.expression.ColumnElement[bool]:
             return SessionRow.status.in_(statuses)
+
+        return inner
+
+    @staticmethod
+    def by_expected_statuses(
+        expected_statuses: Mapping[SessionId, SessionStatus],
+    ) -> QueryCondition:
+        """Match each session only while it is still in the status given for it.
+
+        Used as a compare-and-set guard on status transitions: a session whose
+        status changed after it was read (for example, terminated by a user)
+        no longer matches, so the transition leaves it alone. An empty
+        mapping matches nothing.
+        """
+        ids_by_status: dict[SessionStatus, list[SessionId]] = defaultdict(list)
+        for session_id, status in expected_statuses.items():
+            ids_by_status[status].append(session_id)
+
+        def inner() -> sa.sql.expression.ColumnElement[bool]:
+            if not ids_by_status:
+                return sa.false()
+            return sa.or_(
+                *(
+                    sa.and_(SessionRow.status == status, SessionRow.id.in_(session_ids))
+                    for status, session_ids in ids_by_status.items()
+                )
+            )
 
         return inner
 

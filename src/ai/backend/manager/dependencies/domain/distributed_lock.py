@@ -47,15 +47,18 @@ def create_lock_factory(
     manager_id = config.manager.id
     lock_backend = config.manager.distributed_lock
     log.debug("using {} as the distributed lock backend", lock_backend)
+    # Only the pg_advisory backend implements ``blocking=False`` (it raises
+    # ``LockNotAcquired`` instead of waiting); the other backends accept the
+    # flag and ignore it, keeping their own acquisition behavior.
     match lock_backend:
         case "filelock":
-            return lambda lock_id, lifetime_hint: FileLock(  # noqa: ARG005
+            return lambda lock_id, lifetime_hint, *, blocking=True: FileLock(  # noqa: ARG005
                 ipc_base_path / f"{manager_id}.{lock_id}.lock",
                 timeout=0,
             )
         case "pg_advisory":
-            return lambda lock_id, lifetime_hint: PgAdvisoryLock(  # noqa: ARG005
-                db, lock_id
+            return lambda lock_id, lifetime_hint, *, blocking=True: PgAdvisoryLock(  # noqa: ARG005
+                db, lock_id, blocking=blocking
             )
         case "redlock":
             redlock_config = config.manager.redlock_config
@@ -65,14 +68,14 @@ def create_lock_factory(
                 name="lock",
                 db=REDIS_STREAM_LOCK,
             )
-            return lambda lock_id, lifetime_hint: RedisLock(
+            return lambda lock_id, lifetime_hint, *, blocking=True: RedisLock(  # noqa: ARG005
                 str(lock_id),
                 redis_lock,
                 lifetime=min(lifetime_hint * 2, lifetime_hint + 30),
                 lock_retry_interval=redlock_config["lock_retry_interval"],
             )
         case "etcd":
-            return lambda lock_id, lifetime_hint: EtcdLock(
+            return lambda lock_id, lifetime_hint, *, blocking=True: EtcdLock(  # noqa: ARG005
                 str(lock_id),
                 etcd,
                 lifetime=min(lifetime_hint * 2, lifetime_hint + 30),

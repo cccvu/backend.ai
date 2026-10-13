@@ -995,7 +995,9 @@ class TestScheduleCoordinatorStatusTransition:
             kernel=KernelStatus.PENDING,
         )
 
-        mock_coordinator._repository.update_with_history = AsyncMock(return_value=1)
+        mock_coordinator._repository.update_with_history = AsyncMock(
+            return_value=[session_info.session_id]
+        )
         mock_coordinator._apply_kernel_pending_resets = AsyncMock()
 
         # Act
@@ -1029,7 +1031,9 @@ class TestScheduleCoordinatorStatusTransition:
             kernel=KernelStatus.SCHEDULED,
         )
 
-        mock_coordinator._repository.update_with_history = AsyncMock(return_value=1)
+        mock_coordinator._repository.update_with_history = AsyncMock(
+            return_value=[session_info.session_id]
+        )
         mock_coordinator._apply_kernel_pending_resets = AsyncMock()
 
         # Act
@@ -1065,10 +1069,12 @@ class TestScheduleCoordinatorStatusTransition:
 
         captured_updater = None
 
-        async def capture_update_with_history(updater: Any, history_creator: Any) -> int:
+        async def capture_update_with_history(
+            updater: Any, history_creator: Any
+        ) -> list[SessionId]:
             nonlocal captured_updater
             captured_updater = updater
-            return 1
+            return [session_info.session_id]
 
         mock_coordinator._repository.update_with_history = capture_update_with_history
         mock_coordinator._apply_kernel_pending_resets = AsyncMock()

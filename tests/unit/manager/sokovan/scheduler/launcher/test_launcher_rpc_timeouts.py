@@ -158,3 +158,34 @@ class TestLauncherRPCTimeouts:
         mock_repository.update_session_error_info.assert_awaited_once()
         assert "TimeoutError" in str(mock_repository.update_session_error_info.await_args)
         assert elapsed < BOUNDED
+
+    async def test_overlay_create_network_hang_is_bounded_and_records_error(
+        self,
+        launcher: SessionLauncher,
+        per_agent_client_pool: MagicMock,
+        mock_repository: AsyncMock,
+        mock_network_plugin_ctx: MagicMock,
+        session_for_start_multi_node: SessionDataForStart,
+        image_config_default: dict[UUID, ImageConfigData],
+    ) -> None:
+        network_plugin = mock_network_plugin_ctx.plugins["overlay"]
+        network_plugin.create_network.side_effect = _hang
+
+        started = time.monotonic()
+        with RecorderContext.scope("test", entity_ids=[session_for_start_multi_node.session_id]):
+            # Fail, rather than hang, if the call is unbounded.
+            async with asyncio.timeout(BOUNDED):
+                await launcher.start_sessions_for_handler(
+                    [session_for_start_multi_node],
+                    image_config_default,
+                )
+        elapsed = time.monotonic() - started
+
+        network_plugin.create_network.assert_awaited_once()
+        # The session failed before dispatch: no kernel creation was spawned.
+        assert not launcher._kernel_creations
+        per_agent_client_pool.client(AgentId("agent-1")).create_kernels.assert_not_awaited()
+        per_agent_client_pool.client(AgentId("agent-2")).create_kernels.assert_not_awaited()
+        mock_repository.update_session_error_info.assert_awaited_once()
+        assert "TimeoutError" in str(mock_repository.update_session_error_info.await_args)
+        assert elapsed < BOUNDED

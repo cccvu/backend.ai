@@ -52,7 +52,11 @@ from ai.backend.manager.repositories.base.creator import BulkCreator
 from ai.backend.manager.repositories.base.updater import BatchUpdater
 from ai.backend.manager.repositories.vfolder.mount import prepare_vfolder_mounts
 from ai.backend.manager.types import UserScope
-from ai.backend.manager.views.sokovan.agent import AgentLimit, ResourceGroupResource
+from ai.backend.manager.views.sokovan.agent import (
+    AgentLimit,
+    FencedAgent,
+    ResourceGroupResource,
+)
 from ai.backend.manager.views.sokovan.allocation import SessionAllocation
 from ai.backend.manager.views.sokovan.lifecycle import (
     KernelCreationInfo,
@@ -267,9 +271,12 @@ class SchedulerRepository:
         reason: str,
     ) -> list[SessionId]:
         """
-        Move sessions to ``to_status``, skipping the sessions whose current
-        status cannot enter it. A move to PENDING re-enqueues the sessions'
-        kernels in the same transaction.
+        Move sessions to ``to_status`` and record the transition in the
+        scheduling history. Only the session status moves; the kernels are
+        left to the handler that owns the new status.
+
+        Sessions in a terminal status or in TERMINATING are skipped, so a
+        termination is never overwritten.
 
         Returns the IDs of the sessions actually transitioned.
         """
@@ -611,6 +618,32 @@ class SchedulerRepository:
         return await self._db_source.get_agent_ids_for_sessions(session_ids)
 
     @scheduler_repository_resilience.apply()
+    async def fence_unavailable_agents(
+        self,
+        agent_ids: Sequence[AgentId],
+        resource_group_id: ResourceGroupID,
+        unavailable_for_sec: float,
+    ) -> list[FencedAgent]:
+        """Fence agents unavailable for long enough: set schedulable=false (see the db source).
+
+        Idempotent: an agent already fenced is returned again, so a retry is safe.
+        """
+        return await self._db_source.fence_unavailable_agents(
+            agent_ids, resource_group_id, unavailable_for_sec
+        )
+
+    @scheduler_repository_resilience.apply()
+    async def get_sessions_terminated_on_fenced_agents(
+        self,
+        reason: str,
+        terminated_within_sec: float,
+    ) -> list[SessionId]:
+        """Get sessions terminated for ``reason`` on an agent still fenced and unavailable."""
+        return await self._db_source.get_sessions_terminated_on_fenced_agents(
+            reason, terminated_within_sec
+        )
+
+    @scheduler_repository_resilience.apply()
     async def reset_kernels_to_pending_for_sessions(
         self, session_ids: list[SessionId], reason: str
     ) -> int:
@@ -821,18 +854,23 @@ class SchedulerRepository:
         self,
         updater: BatchUpdater[SessionRow],
         bulk_creator: BulkCreator[SessionSchedulingHistoryRow],
-    ) -> int:
+    ) -> list[SessionId]:
         """Update session statuses and record history in same transaction.
 
         This method combines batch status update with history recording,
         ensuring both operations are atomic within a single transaction.
+        History is recorded only for the sessions that were updated, so a
+        status guard in ``updater.conditions`` (see
+        ``SessionConditions.by_expected_statuses``) acts as a compare-and-set:
+        a session that left its expected status is neither updated nor
+        recorded.
 
         Args:
             updater: BatchUpdater containing spec and conditions for session update
             bulk_creator: BulkCreator containing specs for history records
 
         Returns:
-            Number of sessions updated
+            IDs of the sessions updated
         """
         return await self._db_source.update_with_history(updater, bulk_creator)
 
