@@ -11,13 +11,18 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import AsyncGenerator
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal
+from typing import Any
 
 import pytest
 import sqlalchemy as sa
 from dateutil.tz import tzutc
 
+from ai.backend.common.auth import PublicKey
+from ai.backend.common.clients.valkey_client.valkey_schedule.client import ValkeyScheduleClient
+from ai.backend.common.data.agent.types import AgentInfo
 from ai.backend.common.data.user.types import UserRole
 from ai.backend.common.identifier.domain import DomainID
 from ai.backend.common.identifier.resource_group import ResourceGroupID
@@ -27,14 +32,17 @@ from ai.backend.common.types import (
     AgentId,
     ClusterMode,
     DefaultForUnspecified,
+    DeviceName,
     KernelId,
     ResourceSlot,
     SecretKey,
     SessionId,
     SessionResult,
     SessionTypes,
+    SlotName,
+    SlotTypes,
 )
-from ai.backend.manager.data.agent.types import AgentStatus
+from ai.backend.manager.data.agent.types import AgentHeartbeatUpsert, AgentStatus
 from ai.backend.manager.data.kernel.types import KernelStatus
 from ai.backend.manager.data.session.types import SessionStatus
 from ai.backend.manager.data.user.types import UserStatus
@@ -571,3 +579,118 @@ async def fetch_agent_resources(
             .all()
         )
     return {row.slot_name: row for row in rows}
+
+
+# --- Unavailable agents (fence, release, cleanup requeue) ---
+
+
+@dataclass(frozen=True)
+class ResourceGroupRef:
+    id: ResourceGroupID
+    name: str
+
+
+async def add_resource_group(db: ExtendedAsyncSAEngine) -> ResourceGroupRef:
+    group = ResourceGroupRef(ResourceGroupID(uuid.uuid4()), f"test-sgroup-{uuid.uuid4().hex[:8]}")
+    async with db.begin_session() as db_sess:
+        db_sess.add(
+            ScalingGroupRow(
+                id=group.id,
+                name=group.name,
+                driver="static",
+                scheduler="fifo",
+                scheduler_opts=ScalingGroupOpts(
+                    allowed_session_types=[],
+                    pending_timeout=timedelta(hours=1),
+                    config={},
+                ),
+                driver_opts={},
+                is_active=True,
+            )
+        )
+    return group
+
+
+async def add_agent(
+    db: ExtendedAsyncSAEngine,
+    group: ResourceGroupRef,
+    status: AgentStatus,
+    *,
+    unavailable_for_sec: float | None = None,
+    schedulable: bool = True,
+) -> AgentId:
+    """Add an agent; ``unavailable_for_sec`` backdates ``lost_at`` on the database clock."""
+    agent_id = AgentId(f"test-agent-{uuid.uuid4().hex[:8]}")
+    async with db.begin_session() as db_sess:
+        db_sess.add(
+            AgentRow(
+                id=agent_id,
+                status=status,
+                region="local",
+                scaling_group=group.name,
+                resource_group_id=group.id,
+                schedulable=schedulable,
+                available_slots=ResourceSlot({"cpu": Decimal("10"), "mem": Decimal("10240")}),
+                occupied_slots=ResourceSlot(),
+                addr="127.0.0.1:6001",
+                version="1.0.0",
+                architecture="x86_64",
+            )
+        )
+    if unavailable_for_sec is not None:
+        await set_unavailable_for(db, agent_id, unavailable_for_sec)
+    return agent_id
+
+
+async def set_unavailable_for(db: ExtendedAsyncSAEngine, agent_id: AgentId, seconds: float) -> None:
+    async with db.begin() as conn:
+        await conn.execute(
+            sa.update(AgentRow)
+            .where(AgentRow.id == agent_id)
+            .values(lost_at=sa.func.now() - sa.literal(timedelta(seconds=seconds), sa.Interval))
+        )
+
+
+async def fetch_agent_row(db: ExtendedAsyncSAEngine, agent_id: AgentId) -> dict[str, Any]:
+    async with db.begin_readonly() as conn:
+        row = (
+            await conn.execute(sa.select(AgentRow.__table__).where(AgentRow.id == agent_id))
+        ).one()
+    return dict(row._mapping)
+
+
+async def fetch_schedulable(db: ExtendedAsyncSAEngine, agent_id: AgentId) -> bool:
+    return bool((await fetch_agent_row(db, agent_id))["schedulable"])
+
+
+def heartbeat_upsert(agent_id: AgentId, group_name: str) -> AgentHeartbeatUpsert:
+    return AgentHeartbeatUpsert.from_agent_info(
+        agent_id=agent_id,
+        agent_info=AgentInfo(
+            ip="127.0.0.1",
+            version="1.0.0",
+            scaling_group=group_name,
+            available_resource_slots=ResourceSlot({
+                SlotName("cpu"): "10",
+                SlotName("mem"): "10240",
+            }),
+            slot_key_and_units={
+                SlotName("cpu"): SlotTypes.COUNT,
+                SlotName("mem"): SlotTypes.BYTES,
+            },
+            compute_plugins={DeviceName("cpu"): {}},
+            addr="127.0.0.1:6001",
+            public_key=PublicKey(b"test-public-key"),
+            public_host="127.0.0.1",
+            images=b"\x82\xc4\x00\x00",
+            region="local",
+            architecture="x86_64",
+            auto_terminate_abusing_kernel=False,
+        ),
+        heartbeat_received=datetime.now(tzutc()),
+    )
+
+
+async def delete_force_terminated_cleanup_key(client: ValkeyScheduleClient) -> None:
+    async with client._client.client() as conn:
+        await conn.delete([client._get_force_terminated_cleanup_key()])
