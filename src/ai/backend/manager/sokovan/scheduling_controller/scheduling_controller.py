@@ -579,9 +579,12 @@ class SchedulingController:
         """
         Move sessions to ``to_status`` and broadcast the transition.
 
-        Terminal sessions are skipped. Used by the preemption path (BEP-1055):
-        RUNNING -> PREEMPTED when a victim is confirmed, and PREEMPTED -> PENDING
-        when a reschedule victim is re-enqueued.
+        Terminal and TERMINATING sessions are skipped, so a termination is
+        never overwritten. Used by the preemption path (BEP-1055): the
+        scheduling pass marks reservation holders RESERVED and their victims
+        PREEMPTED, a victim in a reschedule-mode group goes PREEMPTED ->
+        RESCHEDULING, and RESCHEDULING -> PENDING re-enqueues it once its
+        kernels are gone.
 
         Args:
             session_ids: Sessions to transition

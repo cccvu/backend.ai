@@ -1213,8 +1213,9 @@ class ScheduleDBSource:
         scheduling history, as every status transition does.
 
         Only the session status moves; what the new status means happens later,
-        in the handler that owns it. Sessions already in a terminal status are
-        skipped.
+        in the handler that owns it. Sessions already in a terminal status, or
+        being terminated (TERMINATING), are skipped: a termination is never
+        overwritten by another transition.
 
         :param session_ids: Sessions to transition
         :param to_status: Target session status
@@ -1229,6 +1230,7 @@ class ScheduleDBSource:
             markable = sa.and_(
                 SessionRow.id.in_(session_ids),
                 SessionRow.status.not_in(SessionStatus.terminal_statuses()),
+                SessionRow.status != SessionStatus.TERMINATING,
             )
             status_result = await db_sess.execute(
                 sa.select(SessionRow.id, SessionRow.status).where(markable)

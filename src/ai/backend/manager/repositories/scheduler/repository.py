@@ -267,9 +267,12 @@ class SchedulerRepository:
         reason: str,
     ) -> list[SessionId]:
         """
-        Move sessions to ``to_status``, skipping the sessions whose current
-        status cannot enter it. A move to PENDING re-enqueues the sessions'
-        kernels in the same transaction.
+        Move sessions to ``to_status`` and record the transition in the
+        scheduling history. Only the session status moves; the kernels are
+        left to the handler that owns the new status.
+
+        Sessions in a terminal status or in TERMINATING are skipped, so a
+        termination is never overwritten.
 
         Returns the IDs of the sessions actually transitioned.
         """
