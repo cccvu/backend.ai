@@ -281,7 +281,7 @@ def _build_harness(
         ),
         scheduling_controller=AsyncMock(),
         event_producer=event_producer,
-        lock_factory=lambda lock_id, lifetime: nullcontext(),  # type: ignore[arg-type]
+        lock_factory=lambda lock_id, lifetime, *, blocking=True: nullcontext(),  # type: ignore[arg-type]
     )
     return _Harness(
         db=db,
