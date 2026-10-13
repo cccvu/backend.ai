@@ -19,7 +19,7 @@ import sqlalchemy as sa
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncConnection as SAConnection
 from sqlalchemy.ext.asyncio import AsyncSession as SASession
-from sqlalchemy.orm import load_only, selectinload
+from sqlalchemy.orm import aliased, load_only, selectinload
 
 from ai.backend.common import msgpack
 from ai.backend.common.data.permission.types import (
@@ -139,6 +139,7 @@ from ai.backend.manager.types import UserScope
 from ai.backend.manager.views.sokovan.agent import (
     AgentMeta,
     AgentResource,
+    FencedAgent,
     SlotResource,
 )
 from ai.backend.manager.views.sokovan.allocation import (
@@ -3204,6 +3205,64 @@ class ScheduleDBSource:
         for row in rows:
             result[row.session_id].append(AgentId(row.agent))
         return dict(result)
+
+    async def fence_unavailable_agents(
+        self,
+        agent_ids: Sequence[AgentId],
+        resource_group_id: ResourceGroupID,
+        unavailable_for_sec: float,
+    ) -> list[FencedAgent]:
+        """
+        Make the given agents unschedulable if they have been unavailable long enough.
+
+        An agent is fenced only if it is in the given resource group, it is LOST or
+        TERMINATED, it has been so for at least ``unavailable_for_sec`` (by the database
+        clock), and some agent in the same resource group is ALIVE. The last condition
+        keeps a fault that marks every agent of a group unavailable at once (for example
+        on the manager's side) from fencing them all.
+
+        This is a single guarded UPDATE in its own READ COMMITTED transaction, so it is a
+        compare-and-set against the heartbeat, which locks the agent row before it marks
+        the agent ALIVE: whichever commits first wins. The heartbeat never writes
+        ``schedulable``, so a fence outlives the agent's return until an operator
+        re-enables the agent. An agent already unschedulable is returned again.
+
+        :param agent_ids: Agents to fence
+        :param resource_group_id: The resource group the agents must belong to
+        :param unavailable_for_sec: Minimum time since the agent was found unavailable
+        :return: The agents this call fenced (or found fenced), with their status and lost_at
+        """
+        if not agent_ids:
+            return []
+        unavailable = (AgentStatus.LOST, AgentStatus.TERMINATED)
+        peer = aliased(AgentRow, name="peer")
+        alive_peer_exists = (
+            sa.select(peer.id)
+            .where(
+                peer.resource_group_id == resource_group_id,
+                peer.status == AgentStatus.ALIVE,
+            )
+            .exists()
+        )
+        stmt = (
+            sa.update(AgentRow)
+            .where(
+                AgentRow.id.in_(list(agent_ids)),
+                AgentRow.resource_group_id == resource_group_id,
+                AgentRow.status.in_(unavailable),
+                AgentRow.lost_at
+                <= sa.func.now() - sa.literal(timedelta(seconds=unavailable_for_sec), sa.Interval),
+                alive_peer_exists,
+            )
+            .values(schedulable=False)
+            .returning(AgentRow.id, AgentRow.status, AgentRow.lost_at)
+        )
+        async with self._db.begin_read_committed() as db_conn:
+            rows = (await db_conn.execute(stmt)).fetchall()
+        return [
+            FencedAgent(agent_id=AgentId(row.id), status=row.status, lost_at=row.lost_at)
+            for row in rows
+        ]
 
     async def update_kernels_to_creating_for_sessions(
         self, session_ids: list[SessionId], reason: str

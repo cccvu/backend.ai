@@ -167,3 +167,9 @@ SESSION_PULLING_EXPIRY_SEC: Final[float] = 60 * 135  # 2 h 15 min
 DEFAULT_METRIC_RANGE_VECTOR_TIMEWINDOW: Final[str] = "5m"
 
 ARTIFACT_MAX_SCAN_LIMIT: Final[int] = 500
+
+# A TERMINATING session whose open kernels all sit on one agent that has been LOST or TERMINATED
+# for this long is released by force, after that agent is fenced (schedulable=false), as long as
+# another agent in its resource group is ALIVE. The fence stays until an operator re-enables the
+# agent, so the slots freed by the release are never handed out while its containers may run.
+UNAVAILABLE_AGENT_RELEASE_SEC: Final[int] = 300

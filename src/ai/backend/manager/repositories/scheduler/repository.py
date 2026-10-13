@@ -52,7 +52,11 @@ from ai.backend.manager.repositories.base.creator import BulkCreator
 from ai.backend.manager.repositories.base.updater import BatchUpdater
 from ai.backend.manager.repositories.vfolder.mount import prepare_vfolder_mounts
 from ai.backend.manager.types import UserScope
-from ai.backend.manager.views.sokovan.agent import AgentLimit, ResourceGroupResource
+from ai.backend.manager.views.sokovan.agent import (
+    AgentLimit,
+    FencedAgent,
+    ResourceGroupResource,
+)
 from ai.backend.manager.views.sokovan.allocation import SessionAllocation
 from ai.backend.manager.views.sokovan.lifecycle import (
     KernelCreationInfo,
@@ -612,6 +616,21 @@ class SchedulerRepository:
     ) -> dict[SessionId, list[AgentId]]:
         """Get agent IDs assigned to kernels for the given sessions."""
         return await self._db_source.get_agent_ids_for_sessions(session_ids)
+
+    @scheduler_repository_resilience.apply()
+    async def fence_unavailable_agents(
+        self,
+        agent_ids: Sequence[AgentId],
+        resource_group_id: ResourceGroupID,
+        unavailable_for_sec: float,
+    ) -> list[FencedAgent]:
+        """Fence agents unavailable for long enough: set schedulable=false (see the db source).
+
+        Idempotent: an agent already fenced is returned again, so a retry is safe.
+        """
+        return await self._db_source.fence_unavailable_agents(
+            agent_ids, resource_group_id, unavailable_for_sec
+        )
 
     @scheduler_repository_resilience.apply()
     async def reset_kernels_to_pending_for_sessions(
