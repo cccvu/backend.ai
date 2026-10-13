@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 from collections.abc import Awaitable, Mapping, Sequence
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
@@ -38,6 +39,8 @@ from ai.backend.manager.data.session.types import (
     StatusTransitions,
     TransitionStatus,
 )
+from ai.backend.manager.defs import LockID
+from ai.backend.manager.errors.resource import LockNotAcquired
 from ai.backend.manager.metrics.scheduler import SchedulerOperationMetricObserver
 from ai.backend.manager.models.kernel.conditions import KernelConditions
 from ai.backend.manager.models.scheduling_history.row import SessionSchedulingHistoryRow
@@ -238,6 +241,8 @@ class ScheduleCoordinator:
     async def process_lifecycle_schedule(
         self,
         schedule_type: ScheduleType,
+        *,
+        short_cycle: bool = False,
     ) -> bool:
         """Process a lifecycle schedule type using the DeploymentCoordinator pattern.
 
@@ -256,6 +261,8 @@ class ScheduleCoordinator:
 
         Args:
             schedule_type: Type of scheduling operation
+            short_cycle: Whether this is a short-cycle (mark-driven) tick; only
+                affects how a skipped tick is logged
 
         Returns:
             True if operation was performed, False otherwise
@@ -272,11 +279,15 @@ class ScheduleCoordinator:
 
         kernel_handler = self._handlers.kernel_handlers.get(schedule_type)
         if kernel_handler:
-            return await self._process_kernel_schedule(schedule_type, kernel_handler)
+            return await self._process_kernel_schedule(
+                schedule_type, kernel_handler, short_cycle=short_cycle
+            )
 
         lifecycle_handler = self._handlers.lifecycle_handlers.get(schedule_type)
         if lifecycle_handler:
-            return await self._process_lifecycle_handler_schedule(schedule_type, lifecycle_handler)
+            return await self._process_lifecycle_handler_schedule(
+                schedule_type, lifecycle_handler, short_cycle=short_cycle
+            )
 
         cleanup_handler = self._handlers.cleanup_handlers.get(schedule_type)
         if cleanup_handler:
@@ -289,22 +300,21 @@ class ScheduleCoordinator:
         self,
         schedule_type: ScheduleType,
         handler: SessionLifecycleHandler,
+        *,
+        short_cycle: bool = False,
     ) -> bool:
         """Process a lifecycle handler schedule type."""
         try:
             log.debug("Processing lifecycle schedule type: {}", schedule_type.value)
 
             async with AsyncExitStack() as stack:
-                stack.enter_context(self._operation_metrics.measure_operation(handler.name()))
+                # Take the lock (if any) without waiting, before measuring the pass.
+                if handler.lock_id is not None and not await self._enter_tick_lock(
+                    stack, handler.lock_id, schedule_type, handler.name(), short_cycle
+                ):
+                    return False
 
-                # Acquire lock if needed
-                if handler.lock_id is not None:
-                    lock_lifetime = (
-                        self._config_provider.config.manager.session_schedule_lock_lifetime
-                    )
-                    await stack.enter_async_context(
-                        self._lock_factory(handler.lock_id, lock_lifetime)
-                    )
+                stack.enter_context(self._operation_metrics.measure_operation(handler.name()))
 
                 # Process each resource group in parallel
                 resource_group_ids = await self._repository.get_all_resource_groups()
@@ -336,6 +346,70 @@ class ScheduleCoordinator:
                 e,
             )
             raise
+
+    async def _enter_tick_lock(
+        self,
+        stack: AsyncExitStack,
+        lock_id: LockID,
+        schedule_type: ScheduleType,
+        operation: str,
+        short_cycle: bool,
+    ) -> bool:
+        """Enter the pass's lock on ``stack`` without waiting for it.
+
+        A tick never waits for another holder of its lock: waiting would keep
+        a database connection and an event handler busy for as long as the
+        other pass runs. When the lock is taken, the tick is skipped and the
+        schedule type is marked again, so that a later short-cycle tick runs
+        the pass once the holder is done.
+
+        Returns:
+            True if the lock was acquired, False if the tick was skipped.
+        """
+        lock_lifetime = self._config_provider.config.manager.session_schedule_lock_lifetime
+        started_at = time.perf_counter()
+        try:
+            await stack.enter_async_context(
+                self._lock_factory(lock_id, lock_lifetime, blocking=False)
+            )
+        except LockNotAcquired:
+            await self._skip_locked_tick(
+                schedule_type,
+                operation,
+                short_cycle,
+                time.perf_counter() - started_at,
+            )
+            return False
+        return True
+
+    async def _skip_locked_tick(
+        self,
+        schedule_type: ScheduleType,
+        operation: str,
+        short_cycle: bool,
+        duration: float,
+    ) -> None:
+        """Record a tick skipped because its lock is held, and request a retry.
+
+        Never raises: a failure to mark the schedule type again is logged.
+        """
+        self._operation_metrics.observe_operation(
+            operation=operation, status="skipped", duration=duration
+        )
+        try:
+            await self._scheduling_controller.mark_scheduling_needed([schedule_type])
+        except Exception as e:
+            log.warning(
+                "Failed to request {} again after skipping a locked tick: {!r}",
+                schedule_type.value,
+                e,
+            )
+        log.log(
+            logging.DEBUG if short_cycle else logging.INFO,
+            "Skipped {} ({} cycle): its lock is held by another pass",
+            schedule_type.value,
+            "short" if short_cycle else "long",
+        )
 
     async def _process_promotion_schedule(
         self,
@@ -389,6 +463,8 @@ class ScheduleCoordinator:
         self,
         schedule_type: ScheduleType,
         handler: KernelLifecycleHandler,
+        *,
+        short_cycle: bool = False,
     ) -> bool:
         """Process a kernel handler schedule type.
 
@@ -402,16 +478,13 @@ class ScheduleCoordinator:
             log.debug("Processing kernel schedule type: {}", schedule_type.value)
 
             async with AsyncExitStack() as stack:
-                stack.enter_context(self._operation_metrics.measure_operation(handler.name()))
+                # Take the lock (if any) without waiting, before measuring the pass.
+                if handler.lock_id is not None and not await self._enter_tick_lock(
+                    stack, handler.lock_id, schedule_type, handler.name(), short_cycle
+                ):
+                    return False
 
-                # Acquire lock if needed
-                if handler.lock_id is not None:
-                    lock_lifetime = (
-                        self._config_provider.config.manager.session_schedule_lock_lifetime
-                    )
-                    await stack.enter_async_context(
-                        self._lock_factory(handler.lock_id, lock_lifetime)
-                    )
+                stack.enter_context(self._operation_metrics.measure_operation(handler.name()))
 
                 # Process each resource group in parallel
                 resource_group_ids = await self._repository.get_all_resource_groups()
@@ -1641,7 +1714,7 @@ class ScheduleCoordinator:
         if not await self._valkey_schedule.load_and_delete_schedule_mark(schedule_type.value):
             return False
 
-        return await self.process_schedule(schedule_type)
+        return await self.process_lifecycle_schedule(schedule_type, short_cycle=True)
 
     # Kernel event handling methods using the coordinator's kernel state engine
 
@@ -1921,9 +1994,11 @@ class ScheduleCoordinator:
                 initial_delay=30.0,
             ),
             # Sweep stale kernels - maintenance task to clean up kernels with stale presence
+            # It shares the TERMINATING lock with TERMINATE, so a tick skipped while
+            # that lock is held marks it again; the short-cycle task consumes the mark.
             SchedulerTaskSpec(
                 ScheduleType.SWEEP_STALE_KERNELS,
-                short_interval=None,  # No short-cycle task for maintenance
+                short_interval=2.0,
                 long_interval=60.0,
                 initial_delay=30.0,
             ),

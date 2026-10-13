@@ -57,6 +57,7 @@ from ai.backend.manager.data.session.types import (
     SessionStatus,
 )
 from ai.backend.manager.defs import LockID
+from ai.backend.manager.errors.resource import LockNotAcquired
 from ai.backend.manager.models.network import NetworkType
 from ai.backend.manager.repositories.scheduling_history.creators import (
     SessionSchedulingHistoryCreatorSpec,
@@ -262,15 +263,21 @@ class _RecordingLock(AbstractDistributedLock):
     _lock: asyncio.Lock
     _holds: list[float]
     _acquired_at: float
+    _blocking: bool
 
-    def __init__(self, lock: asyncio.Lock, holds: list[float], lifetime: float) -> None:
+    def __init__(
+        self, lock: asyncio.Lock, holds: list[float], lifetime: float, *, blocking: bool
+    ) -> None:
         super().__init__(lifetime=lifetime)
         self._lock = lock
         self._holds = holds
         self._acquired_at = 0.0
+        self._blocking = blocking
 
     @override
     async def __aenter__(self) -> None:
+        if not self._blocking and self._lock.locked():
+            raise LockNotAcquired()
         await self._lock.acquire()
         self._acquired_at = time.monotonic()
 
@@ -284,15 +291,22 @@ class _RecordingLockFactory:
     """``DistributedLockFactory`` over one ``asyncio.Lock`` per lock id."""
 
     holds: dict[LockID, list[float]]
+    blocking_modes: list[bool]
     _locks: dict[LockID, asyncio.Lock]
 
     def __init__(self) -> None:
         self.holds = {}
+        self.blocking_modes = []
         self._locks = {}
 
-    def __call__(self, lock_id: LockID, lifetime_hint: float) -> AbstractDistributedLock:
+    def __call__(
+        self, lock_id: LockID, lifetime_hint: float, *, blocking: bool = True
+    ) -> AbstractDistributedLock:
+        self.blocking_modes.append(blocking)
         lock = self._locks.setdefault(lock_id, asyncio.Lock())
-        return _RecordingLock(lock, self.holds.setdefault(lock_id, []), lifetime_hint)
+        return _RecordingLock(
+            lock, self.holds.setdefault(lock_id, []), lifetime_hint, blocking=blocking
+        )
 
 
 class _KernelCreationInProgress(Exception):
@@ -543,6 +557,8 @@ class TestStartLockHold:
             holds = lock_factory.holds[LockID.LOCKID_SOKOVAN_TARGET_CREATING]
             assert len(holds) == 2
             assert all(hold < PASS_BOUND_SEC for hold in holds)
+            # A tick never waits for the lock.
+            assert lock_factory.blocking_modes == [False, False]
             repository.update_session_error_info.assert_not_awaited()
         finally:
             await _close_and_check(launcher)
