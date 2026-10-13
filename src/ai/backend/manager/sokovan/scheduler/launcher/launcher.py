@@ -761,9 +761,12 @@ class SessionLauncher:
 
                 network_plugin = self._network_plugin_ctx.plugins[driver]
                 try:
-                    network_info = await network_plugin.create_network(
-                        identifier=str(session.session_id)
-                    )
+                    # Bounded like the other network RPCs: this runs under the
+                    # START lock, which must not be held by an unbounded await.
+                    async with asyncio.timeout(AGENT_NETWORK_RPC_TIMEOUT_SEC):
+                        network_info = await network_plugin.create_network(
+                            identifier=str(session.session_id)
+                        )
                     network_config = dict(network_info.options)
                     network_name = network_info.network_id
                 except Exception:
