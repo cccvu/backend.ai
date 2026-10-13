@@ -30,6 +30,11 @@ from ai.backend.manager.sokovan.scheduler.handlers.maintenance.expire_stuck_star
     EXPIRY_REASON,
     ExpireStuckStartsLifecycleHandler,
 )
+from ai.backend.manager.sokovan.scheduler.post_processors.base import PostProcessorContext
+from ai.backend.manager.sokovan.scheduler.post_processors.schedule_marking import (
+    ScheduleMarkingPostProcessor,
+)
+from ai.backend.manager.sokovan.scheduler.results import SessionExecutionResult
 from ai.backend.manager.sokovan.scheduler.scheduler import SchedulerComponents
 from ai.backend.manager.sokovan.scheduler.types import ScheduleType
 from ai.backend.manager.views.sokovan.lifecycle import SessionWithKernels
@@ -580,3 +585,29 @@ class TestExpireStuckStartsWiring:
         handler = handlers[ScheduleType.EXPIRE_STUCK_STARTS]
         assert isinstance(handler, ExpireStuckStartsLifecycleHandler)
         assert handler.name() == "expire-stuck-starts"
+
+
+class TestScheduleMarking:
+    @pytest.mark.parametrize(
+        ("status", "schedule_type"),
+        [
+            (SessionStatus.PREPARING, ScheduleType.CHECK_PULLING_PROGRESS),
+            (SessionStatus.CREATING, ScheduleType.CHECK_CREATING_PROGRESS),
+            (SessionStatus.TERMINATING, ScheduleType.TERMINATE),
+        ],
+    )
+    async def test_a_transition_marks_the_next_check(
+        self,
+        status: SessionStatus,
+        schedule_type: ScheduleType,
+    ) -> None:
+        """A kernel event that arrived before its session's transition found nothing to
+        promote; the transition's own mark makes the check run again at once."""
+        controller = AsyncMock()
+        processor = ScheduleMarkingPostProcessor(controller)
+
+        await processor.execute(
+            PostProcessorContext(result=SessionExecutionResult(), target_statuses={status})
+        )
+
+        controller.mark_scheduling_needed.assert_awaited_once_with([schedule_type])
