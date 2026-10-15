@@ -7,10 +7,13 @@ if [ $arch = "arm64" ]; then
 fi
 
 builder_dockerfile=$(cat <<'EOF'
-FROM alpine:3.20
+# alpine:3.20 by its index digest when this was pinned: a moved tag cannot change the toolchain.
+FROM alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
 RUN apk add --no-cache make gcc musl-dev autoconf automake git wget
 RUN apk add --no-cache zlib-dev zlib-static libtool pkgconfig
 RUN wget https://ftp.gnu.org/gnu/shtool/shtool-2.0.8.tar.gz \
+    && echo "1298a549416d12af239e9f4e787e6e6509210afb49d5cf28eb6ec4015046ae19  shtool-2.0.8.tar.gz" \
+       | sha256sum -c - \
     && tar -xzf shtool-2.0.8.tar.gz \
     && cd shtool-2.0.8 \
     && ./configure && make && make install
@@ -23,11 +26,20 @@ build_script=$(cat <<'EOF'
 #! /bin/sh
 set -e
 
+# A tag can be moved: build only the commit it named when this was pinned.
+DROPBEAR_TAG="DROPBEAR_2026.94"
+DROPBEAR_COMMIT="28216cd9af822732a1549b78621c2ea9a76a0fe5"
+
 git clone -c advice.detachedHead=false --depth=1 \
-  --branch "DROPBEAR_2024.85" \
+  --branch "$DROPBEAR_TAG" \
   https://github.com/mkj/dropbear \
   dropbear
 cd dropbear
+actual_commit=$(git rev-parse HEAD)
+if [ "$actual_commit" != "$DROPBEAR_COMMIT" ]; then
+  echo "$DROPBEAR_TAG is $actual_commit, expected $DROPBEAR_COMMIT" >&2
+  exit 1
+fi
 autoconf && autoheader
 ./configure --enable-static --prefix=/opt/kernel
 
@@ -38,7 +50,6 @@ sed -i 's/\(TRANS_MAX_PAYLOAD_LEN\) [0-9][0-9]*/\1 2621440/' src/default_options
 sed -i 's/\(TRANS_MAX_PAYLOAD_LEN\) [0-9][0-9]*/\1 2621440/' src/default_options.h
 sed -i 's/\(SFTPSERVER_PATH\) "[^"]\+"/\1 "\/opt\/kernel\/sftp-server"/' src/default_options.h
 sed -i 's/\(MAX_CMD_LEN\) [0-9][0-9]*/\1 20000/' src/sysoptions.h
-sed -i '/channel->transwindow -= len;/s/^/\/\//' src/common-channel.c
 sed -i 's/DEFAULT_PATH/getenv("PATH")/' src/svr-chansession.c
 
 # Disable clearing environment variables for new pty sessions and remote commands
