@@ -24,7 +24,7 @@ build_script=$(cat <<'EOF'
 set -e
 
 git clone -c advice.detachedHead=false --depth=1 \
-  --branch "DROPBEAR_2024.85" \
+  --branch "DROPBEAR_2026.94" \
   https://github.com/mkj/dropbear \
   dropbear
 cd dropbear
@@ -38,7 +38,6 @@ sed -i 's/\(TRANS_MAX_PAYLOAD_LEN\) [0-9][0-9]*/\1 2621440/' src/default_options
 sed -i 's/\(TRANS_MAX_PAYLOAD_LEN\) [0-9][0-9]*/\1 2621440/' src/default_options.h
 sed -i 's/\(SFTPSERVER_PATH\) "[^"]\+"/\1 "\/opt\/kernel\/sftp-server"/' src/default_options.h
 sed -i 's/\(MAX_CMD_LEN\) [0-9][0-9]*/\1 20000/' src/sysoptions.h
-sed -i '/channel->transwindow -= len;/s/^/\/\//' src/common-channel.c
 sed -i 's/DEFAULT_PATH/getenv("PATH")/' src/svr-chansession.c
 
 # Disable clearing environment variables for new pty sessions and remote commands
