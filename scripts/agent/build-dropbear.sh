@@ -7,7 +7,8 @@ if [ $arch = "arm64" ]; then
 fi
 
 builder_dockerfile=$(cat <<'EOF'
-FROM alpine:3.20
+# alpine:3.20 by its index digest when this was pinned: a moved tag cannot change the toolchain.
+FROM alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
 RUN apk add --no-cache make gcc musl-dev autoconf automake git wget
 RUN apk add --no-cache zlib-dev zlib-static libtool pkgconfig
 RUN wget https://ftp.gnu.org/gnu/shtool/shtool-2.0.8.tar.gz \
