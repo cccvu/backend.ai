@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import enum
+import re
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -10,6 +11,7 @@ from pydantic import Field
 from pydantic_core import ValidationError
 
 from ai.backend.common.events.types import EventCacheDomain
+from ai.backend.common.exception import InvalidConfigError
 from ai.backend.common.json import dump_json, load_json
 from ai.backend.common.types import BackendAISchema
 
@@ -26,6 +28,17 @@ def bgtask_cache_id(task_id: uuid.UUID, cache_scope: str | None = None) -> str:
     if cache_scope is None:
         return EventCacheDomain.BGTASK.cache_id(str(task_id))
     return EventCacheDomain.BGTASK.cache_id(f"{cache_scope}.{task_id}")
+
+
+# A background task key scope is one key segment: no separator and no glob character.
+BGTASK_KEY_SCOPE_PATTERN = r"^[A-Za-z0-9._-]+$"
+
+
+def validate_bgtask_key_scope(key_scope: str | None) -> str | None:
+    """Return the key scope unchanged, or raise InvalidConfigError if it is not one key segment."""
+    if key_scope is not None and not re.fullmatch(BGTASK_KEY_SCOPE_PATTERN, key_scope):
+        raise InvalidConfigError(f"invalid background task key scope: {key_scope!r}")
+    return key_scope
 
 
 def agent_bgtask_cache_scope(agent_id: str) -> str:

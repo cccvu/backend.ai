@@ -22,6 +22,7 @@ from ai.backend.common.bgtask.types import (
     TaskStatus,
     TaskSubKeyInfo,
     TaskTotalInfo,
+    validate_bgtask_key_scope,
 )
 from ai.backend.common.clients.valkey_client.client import (
     AbstractValkeyClient,
@@ -64,8 +65,10 @@ valkey_bgtask_resilience = Resilience(
 )
 
 _KEY_PREFIX = "bgtask"
+# With a key scope, the task keys carry it before the task ID:
+# bgtask:meta:{key_scope}:{task_id} and so on. The tag and server keys never do.
 _TASK_KEY_PREFIX = f"{_KEY_PREFIX}:meta"  # bgtask:meta:{task_id}
-_TASK_SUBKEY_SET_PREFIX = f"{_KEY_PREFIX}:subkey"  # bgtask:subkey:{task_id}:{subkey}
+_TASK_SUBKEY_SET_PREFIX = f"{_KEY_PREFIX}:subkey"  # bgtask:subkey:{task_id}
 _TASK_SUBTASK_KEY_PREFIX = f"{_KEY_PREFIX}:subtask"  # bgtask:subtask:{task_id}:{subkey}
 _TAG_KEY_PREFIX = f"{_KEY_PREFIX}:tag"  # bgtask:tag:{tag}
 _SERVER_KEY_PREFIX = f"{_KEY_PREFIX}:server"  # bgtask:server:{server_id}
@@ -91,17 +94,27 @@ class TaskSetKey:
 class ValkeyBgtaskClient:
     """
     Client for background task management using Valkey/Glide.
+
+    If ``key_scope`` is set, the task metadata, subkey set and subtask keys are stored under
+    ``bgtask:<kind>:<key_scope>:<task_id>`` instead of ``bgtask:<kind>:<task_id>``, so that
+    each component can be given a key space of its own. Every instance that shares a server ID
+    or a tag must use the same scope, since they take over each other's tasks. Without a scope
+    the keys are unchanged.
     """
 
     _client: AbstractValkeyClient
     _closed: bool
+    _key_scope: str | None
 
     def __init__(
         self,
         client: AbstractValkeyClient,
+        *,
+        key_scope: str | None = None,
     ) -> None:
         self._client = client
         self._closed = False
+        self._key_scope = validate_bgtask_key_scope(key_scope)
 
     @classmethod
     async def create(
@@ -110,17 +123,19 @@ class ValkeyBgtaskClient:
         *,
         db_id: int = REDIS_BGTASK_DB,
         human_readable_name: str = "bgtask",
+        key_scope: str | None = None,
     ) -> Self:
         """
         Create a ValkeyBgtaskClient instance.
         """
+        validate_bgtask_key_scope(key_scope)
         client = create_valkey_client(
             valkey_target,
             db_id=db_id,
             human_readable_name=human_readable_name,
         )
         await client.connect()
-        return cls(client)
+        return cls(client, key_scope=key_scope)
 
     @valkey_bgtask_resilience.apply()
     async def close(self) -> None:
@@ -139,14 +154,19 @@ class ValkeyBgtaskClient:
     def _get_server_key(self, server_id: str) -> str:
         return f"{_SERVER_KEY_PREFIX}:{server_id}"
 
+    def _scoped(self, prefix: str) -> str:
+        if self._key_scope is None:
+            return prefix
+        return f"{prefix}:{self._key_scope}"
+
     def _get_task_key(self, task_id: TaskID) -> str:
-        return f"{_TASK_KEY_PREFIX}:{task_id}"
+        return f"{self._scoped(_TASK_KEY_PREFIX)}:{task_id}"
 
     def _get_task_subkey_set_key(self, task_id: TaskID) -> str:
-        return f"{_TASK_SUBKEY_SET_PREFIX}:{task_id}"
+        return f"{self._scoped(_TASK_SUBKEY_SET_PREFIX)}:{task_id}"
 
     def _get_subtask_key(self, task_id: TaskID, subkey: str) -> str:
-        return f"{_TASK_SUBTASK_KEY_PREFIX}:{task_id}:{subkey}"
+        return f"{self._scoped(_TASK_SUBTASK_KEY_PREFIX)}:{task_id}:{subkey}"
 
     # Task metadata operations
     @valkey_bgtask_resilience.apply()

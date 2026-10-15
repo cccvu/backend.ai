@@ -227,6 +227,7 @@ async def bgtask_ctx(
         redis_profile_target.profile_target(RedisRole.BGTASK).to_valkey_target(),
         human_readable_name="storage_bgtask",
         db_id=REDIS_BGTASK_DB,
+        key_scope=local_config.storage_proxy.bgtask_key_scope,
     )
     bgtask_registry_creator = BgtaskHandlerRegistryCreator(volume_pool, event_producer)
     registry = bgtask_registry_creator.create()

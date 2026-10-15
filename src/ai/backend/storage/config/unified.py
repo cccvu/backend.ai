@@ -14,6 +14,7 @@ from pydantic import (
     model_validator,
 )
 
+from ai.backend.common.bgtask.types import BGTASK_KEY_SCOPE_PATTERN
 from ai.backend.common.config import BaseConfigSchema
 from ai.backend.common.configs import (
     EtcdConfig,
@@ -852,6 +853,25 @@ class StorageProxyConfig(BaseConfigSchema):
             ),
             added_version="26.8.4",
             example=ConfigExample(local='["events_all"]', prod='["events_all"]'),
+        ),
+    ]
+    bgtask_key_scope: Annotated[
+        str | None,
+        Field(
+            default=None,
+            pattern=BGTASK_KEY_SCOPE_PATTERN,
+            validation_alias=AliasChoices("bgtask-key-scope", "bgtask_key_scope"),
+            serialization_alias="bgtask-key-scope",
+        ),
+        BackendAIConfigMeta(
+            description=(
+                "If set, this storage proxy stores its background task metadata under "
+                "'bgtask:<kind>:<scope>:<task_id>' instead of 'bgtask:<kind>:<task_id>', "
+                "so that its keys can be told apart from other components'. Storage proxies "
+                "that share a node ID must use the same scope. Unset keeps the default keys."
+            ),
+            added_version="26.8.4",
+            example=ConfigExample(local="", prod="storage-proxy.storage-proxy-1"),
         ),
     ]
 
